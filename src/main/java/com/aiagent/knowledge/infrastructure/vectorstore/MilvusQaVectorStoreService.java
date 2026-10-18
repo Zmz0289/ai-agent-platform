@@ -275,6 +275,8 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
         row.addProperty("qa_text", text);
         row.addProperty("qa_pair_id", parseLongId(qaPairId));
         row.addProperty("category", limit(firstText(metadata, "category"), 100, "document"));
+        // source_file 是 schema 的必填字段，缺省会整批 insert 失败（The field: source_file is not provided）
+        row.addProperty("source_file", limit(firstText(metadata, "source_file", "source"), 255, "unknown"));
         row.add("embedding", toJsonArray(embedding.vector()));
         row.addProperty("ts", System.currentTimeMillis() / 1000);
         return row;

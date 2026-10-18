@@ -6,6 +6,7 @@ import com.aiagent.ecommerce.infrastructure.repository.EcommerceQaPairRepository
 import com.aiagent.customer_support.config.CsProperties;
 import com.aiagent.customer_support.application.CsImportBatchPersistenceService.PendingPair;
 import com.aiagent.customer_support.application.CsImportBatchPersistenceService.VectorAssignment;
+import com.aiagent.shared.data.DataCleaner;
 import com.aiagent.shared.data.TrainingQaParser;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.JsonArray;
@@ -253,9 +254,13 @@ public class CsDataImportService {
                 return null;
             }
 
-            String cleanQuestion = parsed.question();
-            String cleanAnswer = parsed.answer();
-            String qaText = parsed.embeddingText();
+            String cleanQuestion = DataCleaner.normalize(parsed.question());
+            String cleanAnswer = DataCleaner.normalize(parsed.answer());
+            if (DataCleaner.isNoise(cleanQuestion, cleanAnswer)) {
+                log.debug("第 {} 行: 无信息量噪音，跳过: [{} | {}]", lineNum, cleanQuestion, cleanAnswer);
+                return null;
+            }
+            String qaText = "用户问题：" + cleanQuestion + " 客服回答：" + cleanAnswer;
 
             // 截断到 3072 字符（匹配 schema 的 maxLength）
             if (qaText.length() > 3072) {
@@ -273,7 +278,7 @@ public class CsDataImportService {
                     .qaText(qaText)
                     .category(category)
                     .sourceFile(fileName)
-                    .recordHash(recordHash(fileName, cleanQuestion, cleanAnswer, category))
+                    .recordHash(recordHash(cleanQuestion, cleanAnswer))
                     .build();
         } catch (Exception e) {
             log.warn("第 {} 行 JSON 解析失败: {}", lineNum, e.getMessage());
@@ -291,12 +296,9 @@ public class CsDataImportService {
         return "general";
     }
 
-    private String recordHash(String sourceFile, String question, String answer, String category) {
-        String material = String.join("\u001f",
-                sourceFile == null ? "" : sourceFile,
-                question == null ? "" : question,
-                answer == null ? "" : answer,
-                category == null ? "" : category);
+    /** 内容哈希：SHA-256(归一化 question || answer)，与 EcommerceKnowledgeImportService 保持一致。 */
+    private String recordHash(String question, String answer) {
+        String material = DataCleaner.normalize(question) + "||" + DataCleaner.normalize(answer);
         try {
             return HexFormat.of().formatHex(
                     MessageDigest.getInstance("SHA-256").digest(material.getBytes(StandardCharsets.UTF_8)));
@@ -355,15 +357,21 @@ public class CsDataImportService {
                 Long qaPairId = pairsToStore.get(i).getId();
 
                 JsonObject row = new JsonObject();
-                row.addProperty("question", record.getQuestion());
-                row.addProperty("answer", record.getAnswer());
-                row.addProperty("qa_text", record.getQaText());
+                // question/answer/qa_text 在 schema 中均为非空字段：Milvus 要求 insert 时提供
+                // 所有 non-nullable 字段，且检索侧依赖这些文本构造 chunk（缺失会被直接丢弃）
+                row.addProperty("question", truncate(record.getQuestion(), 1024));
+                // answer 在 collection schema 中 maxLength=2048，MySQL 保留全文，Milvus 侧截断避免整批失败
+                row.addProperty("answer", truncate(record.getAnswer(), 2048));
+                row.addProperty("qa_text", truncate(record.getQaText(), 3072));
                 row.addProperty("qa_pair_id", qaPairId);
-                row.addProperty("category", record.getCategory());
+                row.addProperty("category", truncate(record.getCategory(), 100));
+                // source_file 是 collection 的必填字段（Milvus 字段默认不可为空）
+                row.addProperty("source_file", truncate(record.getSourceFile(), 255));
                 row.add("embedding", toJsonArray(vector));
                 row.addProperty("ts", vectorTimestamp);
                 rows.add(row);
             }
+
 
             // 4. 批量插入 Milvus
             deleteVectorsByQaPairIds(pairsToStore);
@@ -522,6 +530,14 @@ public class CsDataImportService {
             arr.add(v);
         }
         return arr;
+    }
+
+    /** 按 Milvus VarChar 的 maxLength 截断，避免个别超长文本导致整批 insert 失败。 */
+    private String truncate(String value, int maxLength) {
+        if (value == null) {
+            return "";
+        }
+        return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
     // =============================================

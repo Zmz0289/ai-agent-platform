@@ -17,7 +17,10 @@ class EcommerceDataGeneratorControllerTest {
     private Executor testExecutor = r -> r.run();
     private EcommerceDataGeneratorController controller;
 
-    @BeforeEach void setUp() { controller = new EcommerceDataGeneratorController(generatorService, testExecutor); }
+    @BeforeEach void setUp() {
+        controller = new EcommerceDataGeneratorController(
+                generatorService, testExecutor, new com.aiagent.ecommerce.config.EcommerceProperties());
+    }
 
     @Test void shouldRunGenerator() {
         ResponseEntity<Map<String, Object>> resp = controller.runGenerator();

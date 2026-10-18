@@ -54,8 +54,9 @@ public class MilvusInitConfig {
             return thread;
         });
 
+        Future<MilvusClientV2> future = null;
         try {
-            Future<MilvusClientV2> future = executor.submit(() -> {
+            future = executor.submit(() -> {
                 ConnectConfig config = ConnectConfig.builder()
                         .uri("http://" + milvusConfig.getHost() + ":" + milvusConfig.getPort())
                         .build();
@@ -66,6 +67,11 @@ public class MilvusInitConfig {
                     try {
                         client.useDatabase(databaseName);
                     } catch (Exception exception) {
+                        // 只有服务端明确返回"库不存在"才自动建库；连接超时、网络不可达、
+                        // 被中断等错误必须原样抛出，否则会在不可用连接上反复建库并产生大量重试日志
+                        if (!isDatabaseMissing(exception)) {
+                            throw exception;
+                        }
                         if (milvusConfig.isReadOnly()) {
                             throw new IllegalStateException(
                                     "Milvus database [" + databaseName + "] is unavailable in read-only mode",
@@ -95,7 +101,10 @@ public class MilvusInitConfig {
                     milvusConfig.isReadOnly());
             return client;
         } catch (TimeoutException e) {
-            log.warn("MilvusClientV2 connection timed out after {}ms; starting without Milvus", 
+            if (future != null) {
+                future.cancel(true);
+            }
+            log.warn("MilvusClientV2 connection timed out after {}ms; starting without Milvus (raise MILVUS_CONNECTION_TIMEOUT_MS if the server is remote)",
                     milvusConfig.getConnectionTimeoutMs());
         } catch (Exception e) {
             log.warn("MilvusClientV2 connection failed: {}:{} - {} (starting without Milvus)", 
@@ -106,6 +115,22 @@ public class MilvusInitConfig {
             executor.shutdownNow();
         }
         return null;
+    }
+
+    /**
+     * 判断异常是否为"数据库不存在"（SDK 抛出 IllegalArgumentException: Database xxx not exist）。
+     * 连接超时、UNAVAILABLE、被中断等错误不应触发自动建库。
+     */
+    private boolean isDatabaseMissing(Throwable throwable) {
+        Throwable cause = throwable;
+        while (cause != null) {
+            String message = cause.getMessage();
+            if (message != null && message.toLowerCase().contains("not exist")) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     private boolean isTcpReachable(AiProperties.Milvus config) {

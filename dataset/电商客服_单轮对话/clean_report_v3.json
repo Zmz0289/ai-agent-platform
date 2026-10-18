@@ -1,0 +1,16 @@
+{
+  "source": "d:\\Work\\Code\\AiAgent\\ai-agent-platform\\dataset\\电商客服_单轮对话\\train_clean_v2_small.jsonl",
+  "output": "d:\\Work\\Code\\AiAgent\\ai-agent-platform\\dataset\\电商客服_单轮对话\\train_clean_v3.jsonl",
+  "stages": {
+    "rows_read": 226600,
+    "valid_after_filter": 195742,
+    "unique_qa_pairs": 94476,
+    "conflict_questions": 3525,
+    "final_kept": 68745
+  },
+  "dropped_detail": {
+    "chit_chat": 30826,
+    "empty_key": 32,
+    "short_after_resolve": 14013
+  }
+}

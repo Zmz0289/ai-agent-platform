@@ -151,7 +151,7 @@ public class AiAgentController {
                                 question,
                                 aiAgentService.chat(
                                         username, sessionId, question, useRag, persistentContext),
-                                "normal"
+                                "react"
                         );
                     }
 

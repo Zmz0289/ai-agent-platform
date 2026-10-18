@@ -129,7 +129,11 @@ public class AiProperties {
         /** FAQ 优先级联检索总开关（FAQ 命中优先，未命中回退 raw 库）。 */
         private boolean faqFirstEnabled = false;
         private int dimension = 1024;
-        private int connectionTimeoutMs = 2000;
+        /**
+         * 连接超时（毫秒）。远程 Milvus 建连 + useDatabase 通常需要 2~3s，
+         * 过小会导致初始化被判超时、客户端被置空（表现为"Milvus 客户端不可用"）。
+         */
+        private int connectionTimeoutMs = 15000;
         private boolean readOnly = false;
         private boolean fallbackEnabled = false;
     }
@@ -292,6 +296,10 @@ public class AiProperties {
     }
     @Data
     public static class Security {
+        /**
+         * 是否启用接口鉴权。关闭后所有请求以固定学习账号（demo，USER+ADMIN）执行。
+         */
+        private Boolean authEnabled = true;
         private String adminApiKey;
         private String adminHeaderName = "X-Admin-Api-Key";
         private Jwt jwt = new Jwt();

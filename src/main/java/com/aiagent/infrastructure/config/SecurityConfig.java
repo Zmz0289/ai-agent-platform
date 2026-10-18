@@ -1,8 +1,11 @@
 package com.aiagent.infrastructure.config;
 
+import com.aiagent.infrastructure.security.DevAuthFilter;
 import com.aiagent.infrastructure.security.JwtAuthenticationFilter;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -22,6 +25,7 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 import java.nio.charset.StandardCharsets;
 
+@Slf4j
 @Configuration
 @EnableWebSecurity
 @RequiredArgsConstructor
@@ -31,6 +35,7 @@ public class SecurityConfig {
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final ApiProtectionFilter apiProtectionFilter;
     private final AiProperties aiProperties;
+    private final ObjectProvider<DevAuthFilter> devAuthFilterProvider;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -49,7 +54,22 @@ public class SecurityConfig {
                     response.setContentType(MediaType.APPLICATION_JSON_VALUE);
                     response.getWriter().write("{\"error\":\"Unauthorized\",\"message\":\"Authentication required\"}");
                 })
-            )
+            );
+
+        if (isAuthEnabled()) {
+            log.info("API authentication enabled (ai.security.auth-enabled=true)");
+            configureAuthenticatedChain(http);
+        } else {
+            log.info("API authentication disabled (ai.security.auth-enabled=false), requests run as '{}'",
+                    DevAuthFilter.DEV_USERNAME);
+            configureOpenChain(http);
+        }
+
+        return http.build();
+    }
+
+    private void configureAuthenticatedChain(HttpSecurity http) throws Exception {
+        http
             .authorizeHttpRequests(auth -> {
                 auth
                     .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
@@ -90,8 +110,25 @@ public class SecurityConfig {
             .addFilterBefore(adminApiKeyFilter, AnonymousAuthenticationFilter.class)
             .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class)
             .addFilterAfter(apiProtectionFilter, JwtAuthenticationFilter.class);
+    }
 
-        return http.build();
+    /**
+     * 学习模式：全部接口放行，并由 {@link DevAuthFilter} 注入固定账号，便于直接调试 RAG。
+     * 仅保留限流/成本保护过滤器，避免误删业务无关的保护逻辑。
+     */
+    private void configureOpenChain(HttpSecurity http) throws Exception {
+        http.authorizeHttpRequests(auth -> auth.anyRequest().permitAll());
+
+        DevAuthFilter devAuthFilter = devAuthFilterProvider.getIfAvailable();
+        if (devAuthFilter != null) {
+            http.addFilterBefore(devAuthFilter, AnonymousAuthenticationFilter.class);
+        }
+        http.addFilterAfter(apiProtectionFilter, AnonymousAuthenticationFilter.class);
+    }
+
+    private boolean isAuthEnabled() {
+        AiProperties.Security security = aiProperties.getSecurity();
+        return security == null || !Boolean.FALSE.equals(security.getAuthEnabled());
     }
 
     @Bean

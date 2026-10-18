@@ -67,7 +67,7 @@ ai:
   model:
     # supported chat providers: deepseek | qianwen | doubao | qwen3-flash | local
     # non-local providers automatically degrade to the local model; no separate fallback toggle is exposed
-    provider: deepseek
+    provider: local
     deepseek:
       api-key: ${DEEPSEEK_API_KEY:your-api-key}
       model-name: deepseek-chat-v2
@@ -85,18 +85,18 @@ ai:
       model-name: qwen3.7-flash
       base-url: https://ws-saj0dk2icyo8g1ub.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     local:
-      base-url: http://localhost:11434/v1
-      model-name: coder:qwen7b
-      api-key: dummy
+      base-url: http://172.40.1.216:11434/v1
+      model-name: qwen3.8:27b
+      api-key: qwen3.8:27b
 
   embedding:
     # supported embedding providers: deepseek | qianwen | local | local-qwen3 | siliconflow
     # provider: local          -> bge-m3 on a local OpenAI-compatible endpoint
     # provider: local-qwen3    -> qwen3-embedding:4b via local Ollama-compatible endpoint
     # provider: siliconflow    -> hosted BAAI/bge-m3
-    provider: siliconflow
+    provider: local
     local:
-      base-url: http://localhost:11434/v1
+      base-url: http://172.40.1.216:11434/v1
       model-name: bge-m3
       dimension: 1024
     local-qwen3:
@@ -125,7 +125,7 @@ ai:
       faq-top-k: ${MILVUS_FAQ_TOP_K:3}
       faq-first-enabled: ${MILVUS_FAQ_FIRST_ENABLED:false}
       dimension: 1024
-      connection-timeout-ms: ${MILVUS_CONNECTION_TIMEOUT_MS:2000}
+      connection-timeout-ms: ${MILVUS_CONNECTION_TIMEOUT_MS:15000}
       read-only: ${MILVUS_READ_ONLY:false}
       fallback-enabled: ${MILVUS_FALLBACK_ENABLED:false}
   document:
@@ -224,6 +224,8 @@ ai:
     summary-interval: 5
 
   security:
+    # 学习模式：false 时关闭所有接口鉴权，请求以固定账号 demo 执行；生产环境请设为 true
+    auth-enabled: ${AI_AUTH_ENABLED:false}
     admin-api-key: ${ADMIN_API_KEY:}
     admin-header-name: X-Admin-Api-Key
     jwt:
@@ -305,10 +307,22 @@ ecommerce:
   generator:
     # 每个类别生成的目标 QA 对数量（100x 提升，预算 3.0 元可支撑 ~8100 条）
     target-per-category: 500
-    # 单次 API 调用生成的条目数（增大减少 API 调用次数）
-    batch-size: 20
+    # 单次 API 调用生成的条目数；本地小模型建议 5-10，避免输出被 max-tokens 截断
+    batch-size: ${GENERATOR_BATCH_SIZE:10}
     # 要生成的类别列表（留空使用默认 8 个类别）
     categories:
+    # 生成模型提供方：local(Ollama) | doubao | deepseek | qianwen
+    provider: ${GENERATOR_PROVIDER:local}
+    # 以下三项留空时复用 ai.model.<provider> 的 base-url / api-key / model-name
+    base-url: ${GENERATOR_BASE_URL:}
+    model-name: ${GENERATOR_MODEL_NAME:}
+    api-key: ${GENERATOR_API_KEY:}
+    max-tokens: ${GENERATOR_MAX_TOKENS:2048}
+    temperature: ${GENERATOR_TEMPERATURE:0.5}
+    # 本地 30B 模型生成较慢，默认 180s
+    timeout-seconds: ${GENERATOR_TIMEOUT_SECONDS:180}
+    # 调用间隔毫秒，本地模型可设为 0
+    request-interval-ms: ${GENERATOR_REQUEST_INTERVAL_MS:0}
 
 # =============================================
 # 客服训练数据导入配置

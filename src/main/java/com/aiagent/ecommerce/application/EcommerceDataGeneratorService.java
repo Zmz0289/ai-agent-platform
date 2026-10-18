@@ -12,6 +12,7 @@ import jakarta.transaction.Transactional;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -63,10 +64,8 @@ public class EcommerceDataGeneratorService {
     // =============================================
 
     /** 输出目录 */
-    private static final String GENERATOR_MODEL_NAME = "doubao-seed-2-0-mini";
     private static final DateTimeFormatter OUTPUT_TIMESTAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final long REQUEST_INTERVAL_MS = 500L;
 
     private static final String OUTPUT_DIR = "generated_data";
 
@@ -125,8 +124,10 @@ public class EcommerceDataGeneratorService {
     // 依赖注入
     // =============================================
 
-    /** 专门用于数据生成的 Doubao 模型（更大 maxTokens） */
+    /** 专门用于数据生成的模型（provider 可配置，默认本地 Ollama） */
     private final dev.langchain4j.model.chat.ChatLanguageModel generatorModel;
+    /** 实际生效的 provider:model，用于日志与生成文件头。 */
+    private String generatorModelLabel = "unresolved";
     private final EcommerceQaPairRepository qaPairRepository;
     private final ObjectMapper objectMapper;
     private final AiProperties aiProperties;
@@ -148,26 +149,98 @@ public class EcommerceDataGeneratorService {
         this.objectMapper = objectMapper;
         this.aiProperties = aiProperties;
         this.ecommerceProperties = ecommerceProperties;
-        // 创建独立的 Doubao 生成模型（与主模型隔离，专用于数据生成）
+        // 创建独立的生成模型（与主聊天模型隔离，专用于数据生成）
         this.generatorModel = createGeneratorModel();
     }
 
     /**
-     * 创建独立的生成模型：
-     * - 使用 Doubao（低成本）
-     * - 更大 maxTokens（2048）支持批量生成
-     * - 温度 0.5 兼顾一致性和多样性
+     * 创建独立的生成模型（与主聊天模型隔离）。
+     *
+     * <p>由 {@code ecommerce.generator.provider} 决定使用哪家模型，支持本地 Ollama
+     * （OpenAI 兼容接口）。base-url / api-key / model-name 留空时复用
+     * {@code ai.model.<provider>} 的同名配置，因此切到本地只需
+     * {@code provider: local}，与主模型共用 Ollama 地址和模型名。</p>
      */
     private dev.langchain4j.model.chat.ChatLanguageModel createGeneratorModel() {
-        AiProperties.Doubao doubaoConfig = aiProperties.getModel().getDoubao();
+        EcommerceProperties.Generator generator = ecommerceProperties.getGenerator();
+        String provider = StringUtils.hasText(generator.getProvider())
+                ? generator.getProvider().trim().toLowerCase(Locale.ROOT)
+                : "local";
+        ModelEndpoint endpoint = resolveEndpoint(provider, generator);
+        this.generatorModelLabel = provider + ":" + endpoint.modelName();
+
+        log.info("数据生成模型: model={}, baseUrl={}, maxTokens={}, temperature={}, "
+                        + "timeout={}s, batchSize={}, interval={}ms",
+                generatorModelLabel, endpoint.baseUrl(), generator.getMaxTokens(),
+                generator.getTemperature(), generator.getTimeoutSeconds(),
+                generator.getBatchSize(), generator.getRequestIntervalMs());
+
         return OpenAiChatModel.builder()
-                .baseUrl(doubaoConfig.getBaseUrl())
-                .apiKey(doubaoConfig.getApiKey())
-                .modelName(doubaoConfig.getModelName())
-                .temperature(0.5)
-                .maxTokens(2048)       // 比默认 512 更大，支持批量生成
-                .timeout(Duration.ofSeconds(60))
+                .baseUrl(endpoint.baseUrl())
+                .apiKey(endpoint.apiKey())
+                .modelName(endpoint.modelName())
+                .temperature(generator.getTemperature())
+                .maxTokens(generator.getMaxTokens())
+                .timeout(Duration.ofSeconds(generator.getTimeoutSeconds()))
                 .build();
+    }
+
+    /** 解析实际使用的 base-url / api-key / model-name，显式配置优先，否则回退到 ai.model.*。 */
+    private ModelEndpoint resolveEndpoint(String provider, EcommerceProperties.Generator generator) {
+        String defaultBaseUrl;
+        String defaultApiKey;
+        String defaultModelName;
+
+        switch (provider) {
+            case "doubao" -> {
+                AiProperties.Doubao config = aiProperties.getModel().getDoubao();
+                defaultBaseUrl = config.getBaseUrl();
+                defaultApiKey = config.getApiKey();
+                defaultModelName = config.getModelName();
+            }
+            case "deepseek" -> {
+                AiProperties.Deepseek config = aiProperties.getModel().getDeepseek();
+                defaultBaseUrl = config.getBaseUrl();
+                defaultApiKey = config.getApiKey();
+                defaultModelName = config.getModelName();
+            }
+            case "qianwen" -> {
+                AiProperties.Qianwen config = aiProperties.getModel().getQianwen();
+                defaultBaseUrl = config.getBaseUrl();
+                defaultApiKey = config.getApiKey();
+                defaultModelName = config.getModelName();
+            }
+            case "local" -> {
+                AiProperties.Local config = aiProperties.getModel().getLocal();
+                defaultBaseUrl = config.getBaseUrl();
+                defaultApiKey = config.getApiKey();
+                defaultModelName = config.getModelName();
+            }
+            default -> {
+                log.warn("未知的生成模型 provider [{}]，回退到 local(Ollama)", provider);
+                AiProperties.Local config = aiProperties.getModel().getLocal();
+                defaultBaseUrl = config.getBaseUrl();
+                defaultApiKey = config.getApiKey();
+                defaultModelName = config.getModelName();
+            }
+        }
+
+        return new ModelEndpoint(
+                firstNonBlank(generator.getBaseUrl(), defaultBaseUrl),
+                firstNonBlank(generator.getApiKey(), defaultApiKey, "dummy"),
+                firstNonBlank(generator.getModelName(), defaultModelName));
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (StringUtils.hasText(value)) {
+                return value.trim();
+            }
+        }
+        return "";
+    }
+
+    private record ModelEndpoint(String baseUrl, String apiKey, String modelName) {
     }
 
     // =============================================
@@ -246,7 +319,7 @@ public class EcommerceDataGeneratorService {
     private void logBanner(String format, String description, int categoryCount) {
         log.info("╔══════════════════════════════════════════════════════╗");
         log.info("║     {} 生成: {}", format, description);
-        log.info("║ 模型: {}", GENERATOR_MODEL_NAME);
+        log.info("║ 模型: {}", generatorModelLabel);
         log.info("║ 类别: {} 个", categoryCount);
         log.info("╚══════════════════════════════════════════════════════╝");
     }
@@ -271,7 +344,7 @@ public class EcommerceDataGeneratorService {
         log.info("╔══════════════════════════════════════════════════════╗");
         log.info("║     电商客服训练数据生成器启动（全量）                  ");
         log.info("╠══════════════════════════════════════════════════════╣");
-        log.info("║ 模型: {}", GENERATOR_MODEL_NAME);
+        log.info("║ 模型: {}", generatorModelLabel);
         log.info("║ 总预算: ¥{} (约 {} tokens)", BUDGET + CONVERSATION_EXTRA_BUDGET, (long)((BUDGET + CONVERSATION_EXTRA_BUDGET) / COST_PER_MILLION_TOKENS * 1_000_000));
         log.info("║ 其中对话模块额外分配: ¥{}", CONVERSATION_EXTRA_BUDGET);
         log.info("║ 类别: {} 个", categories.size());
@@ -324,7 +397,7 @@ public class EcommerceDataGeneratorService {
             writer.write("=== 生成时间: " +
                     LocalDateTime.now().format(OUTPUT_TIMESTAMP) +
                     " ===\n");
-            writer.write("=== 生成模型: " + GENERATOR_MODEL_NAME + " ===\n");
+            writer.write("=== 生成模型: " + generatorModelLabel + " ===\n");
             writer.write("=== 条目数: " + entries.size() + " (中间结果) ===\n\n");
             for (String line : entries) {
                 writer.write(line);
@@ -381,7 +454,10 @@ public class EcommerceDataGeneratorService {
                     log.info("[{}][{}] 生成 {} {}, 累计 {} {}", format.label, category,
                             parsedEntries.size(), format.unit, format.dataCount(entries), format.unit);
                     appendIntermediate(outputPath, parsedEntries);
-                    Thread.sleep(REQUEST_INTERVAL_MS);
+                    long intervalMs = ecommerceProperties.getGenerator().getRequestIntervalMs();
+                    if (intervalMs > 0) {
+                        Thread.sleep(intervalMs);
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     log.warn("[{}][{}] 生成任务已中断", format.label, category);
@@ -676,7 +752,7 @@ public class EcommerceDataGeneratorService {
             writer.write("=== 生成时间: " +
                     LocalDateTime.now().format(OUTPUT_TIMESTAMP) +
                     " ===\n");
-            writer.write("=== 生成模型: " + GENERATOR_MODEL_NAME + " ===\n");
+            writer.write("=== 生成模型: " + generatorModelLabel + " ===\n");
             writer.write("=== 条目数: " + content.size() + " ===\n\n");
 
             for (String line : content) {

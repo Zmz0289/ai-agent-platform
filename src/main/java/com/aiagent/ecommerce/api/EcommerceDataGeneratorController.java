@@ -1,9 +1,11 @@
 package com.aiagent.ecommerce.api;
 
 import com.aiagent.ecommerce.application.EcommerceDataGeneratorService;
+import com.aiagent.ecommerce.config.EcommerceProperties;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
@@ -18,6 +20,7 @@ public class EcommerceDataGeneratorController {
 
     private final EcommerceDataGeneratorService generatorService;
     private final Executor taskExecutor;
+    private final EcommerceProperties ecommerceProperties;
 
     @PostMapping("/run")
     public ResponseEntity<Map<String, Object>> runGenerator() {
@@ -34,7 +37,7 @@ public class EcommerceDataGeneratorController {
 
         return ResponseEntity.ok(Map.of(
                 "status", "started",
-                "model", "doubao-seed-2-0-mini",
+                "model", generatorModelLabel(),
                 "outputDir", "generated_data/",
                 "message", "Full generation task started, check logs for progress"
         ));
@@ -75,10 +78,22 @@ public class EcommerceDataGeneratorController {
         formats.put("qa_pairs.jsonl", "Standard JSONL format, ~2000-2400 entries");
 
         return ResponseEntity.ok(Map.of(
-                "model", "doubao-seed-2-0-mini",
+                "model", generatorModelLabel(),
                 "outputDir", "generated_data/",
                 "formats", formats
         ));
+    }
+
+    /** 返回当前生效的生成模型标识，例如 local:qwen3-coder:30b。 */
+    private String generatorModelLabel() {
+        EcommerceProperties.Generator generator = ecommerceProperties.getGenerator();
+        String provider = StringUtils.hasText(generator.getProvider())
+                ? generator.getProvider().trim()
+                : "local";
+        String model = StringUtils.hasText(generator.getModelName())
+                ? generator.getModelName().trim()
+                : "(ai.model." + provider + ")";
+        return provider + ":" + model;
     }
 
     @GetMapping("/stats")

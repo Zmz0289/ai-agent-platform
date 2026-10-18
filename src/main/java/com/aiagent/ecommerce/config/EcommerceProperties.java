@@ -45,7 +45,21 @@ public class EcommerceProperties {
     @Data
     public static class Generator {
         private int targetPerCategory = 500;
-        private int batchSize = 20;
+        private int batchSize = 5;
         private List<String> categories;
+
+        /** 生成模型提供方：local(Ollama) | doubao | deepseek | qianwen。 */
+        private String provider = "local";
+        /** 以下三项留空时复用 ai.model.&lt;provider&gt; 中的同名配置。 */
+        private String baseUrl;
+        private String apiKey;
+        private String modelName;
+        /** 单次调用最大输出 token；本地小模型批量生成时不宜过大，避免截断。 */
+        private int maxTokens = 2048;
+        private double temperature = 0.5;
+        /** 本地大模型生成较慢，默认给足 180 秒。 */
+        private int timeoutSeconds = 180;
+        /** 每次调用后的间隔毫秒，本地模型可设为 0。 */
+        private long requestIntervalMs = 500;
     }
 }
