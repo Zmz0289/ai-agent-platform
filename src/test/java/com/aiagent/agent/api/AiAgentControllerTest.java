@@ -2,6 +2,7 @@ package com.aiagent.agent.api;
 
 import com.aiagent.agent.application.AiAgentService;
 import com.aiagent.agent.application.ChatExecutionResult;
+import com.aiagent.agent.application.ChatStreamEvent;
 import com.aiagent.agent.application.MultiAgentExecutionResult;
 import com.aiagent.agent.application.MultiAgentExecutionTrace;
 import com.aiagent.agent.application.MultiAgentService;
@@ -23,6 +24,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.security.authentication.TestingAuthenticationToken;
 import reactor.core.publisher.Flux;
@@ -109,6 +111,40 @@ class AiAgentControllerTest {
                 .containsEntry("mode", "multi-agent");
         assertThat(stream).containsExactly("A", "B");
         verify(aiAgentService).clearSession("user", "session-1");
+    }
+
+    @Test
+    void shouldStreamChatAsServerSentEvents() {
+        ChatExecutionResult result = ChatExecutionResult.builder()
+                .answer("AB")
+                .adaptiveRagContext(AdaptiveRagContext.builder()
+                        .routeType(RagRouteType.SINGLE_HOP)
+                        .usedAdaptive(true)
+                        .chunkCount(2)
+                        .build())
+                .cacheHit(false)
+                .responseSource("adaptive_rag")
+                .build();
+        when(aiAgentService.streamChatEvents(
+                "user", "session-1", "stream question", true,
+                AiAgentService.ChatMode.NORMAL, PersistentIdempotencyContext.disabled()))
+                .thenReturn(Flux.just(
+                        ChatStreamEvent.token("A"),
+                        ChatStreamEvent.done("AB", result)));
+
+        List<ServerSentEvent<String>> events = controller.streamChatPost(
+                        "session-1", "stream question", true, "normal", true, null, authentication)
+                .collectList()
+                .block();
+
+        assertThat(events).hasSize(2);
+        assertThat(events.get(0).data())
+                .contains("\"type\":\"token\"")
+                .contains("\"content\":\"A\"");
+        assertThat(events.get(1).data())
+                .contains("\"type\":\"done\"")
+                .contains("\"answer\":\"AB\"")
+                .contains("\"routeType\":\"SINGLE_HOP\"");
     }
 
     @Test

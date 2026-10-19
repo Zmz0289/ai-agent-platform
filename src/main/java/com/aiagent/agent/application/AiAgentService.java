@@ -21,6 +21,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 import java.util.List;
@@ -93,16 +94,37 @@ public class AiAgentService {
                                    String question,
                                    boolean useRag,
                                    PersistentIdempotencyContext idempotencyContext) {
+        return streamChatEvents(username, sessionId, question, useRag, ChatMode.NORMAL, idempotencyContext)
+                .filter(ChatStreamEvent::isToken)
+                .map(ChatStreamEvent::content);
+    }
+
+    /**
+     * 以事件流的形式执行对话：{@code token} 事件增量输出文本，{@code done} 事件携带完整答案与 RAG 解释信息。
+     */
+    public Flux<ChatStreamEvent> streamChatEvents(String username,
+                                                  String sessionId,
+                                                  String question,
+                                                  boolean useRag,
+                                                  ChatMode mode,
+                                                  PersistentIdempotencyContext idempotencyContext) {
         validateChatRequest(username, sessionId, question);
         var completed = chatSessionService.findCompletedResponse(
                 username, sessionId, idempotencyContext, String.class);
         if (completed.isPresent()) {
-            return Flux.just(completed.get());
+            String answer = completed.get();
+            return Flux.just(
+                    ChatStreamEvent.token(answer),
+                    ChatStreamEvent.done(answer, ChatExecutionResult.builder()
+                            .answer(answer)
+                            .cacheHit(true)
+                            .responseSource("idempotent_replay")
+                            .build()));
         }
-        Timer.Sample sample = metricsService.startSample();
 
+        Timer.Sample sample = metricsService.startSample();
         String optimizedHistory = longContextManager.getOptimizedContext(sessionId, question);
-        String cacheNamespace = ChatMode.NORMAL.cacheNamespace(useRag);
+        String cacheNamespace = mode.cacheNamespace(useRag);
         String cached = StringUtils.hasText(optimizedHistory)
                 ? null
                 : semanticCacheService.getIfCached(cacheNamespace, question);
@@ -110,14 +132,80 @@ public class AiAgentService {
             String persistedAnswer = chatSessionService.recordSuccessfulExchange(
                     username, sessionId, question, cached,
                     idempotencyContext, cached, String.class);
-            metricsService.recordChat("stream", useRag, true, true, sample);
-            return Flux.just(persistedAnswer);
+            metricsService.recordChat(
+                    mode == ChatMode.REACT ? ChatMode.REACT.metricName : "stream", useRag, true, true, sample);
+            return Flux.just(
+                    ChatStreamEvent.token(persistedAnswer),
+                    ChatStreamEvent.done(persistedAnswer, ChatExecutionResult.builder()
+                            .answer(persistedAnswer)
+                            .cacheHit(true)
+                            .responseSource("semantic_cache")
+                            .build()));
         }
 
-        String context = resolveAdaptiveContext(question, useRag).getContext();
-        String fullPrompt = buildPrompt(optimizedHistory, context, question);
+        AdaptiveRagContext adaptiveContext = resolveAdaptiveContext(question, useRag);
+        if (mode == ChatMode.REACT) {
+            return streamReActAnswer(username, sessionId, question, useRag,
+                    optimizedHistory, cacheNamespace, adaptiveContext, idempotencyContext, sample);
+        }
+        return streamModelTokens(username, sessionId, question, useRag,
+                optimizedHistory, cacheNamespace, adaptiveContext, idempotencyContext, sample);
+    }
 
-        Sinks.Many<String> sink = Sinks.many().unicast().onBackpressureBuffer();
+    /**
+     * ReAct 需要多步推理与工具调用，无法逐 token 输出；在弹性线程池执行完毕后以单条 token 事件返回最终答案。
+     */
+    private Flux<ChatStreamEvent> streamReActAnswer(String username,
+                                                    String sessionId,
+                                                    String question,
+                                                    boolean useRag,
+                                                    String optimizedHistory,
+                                                    String cacheNamespace,
+                                                    AdaptiveRagContext adaptiveContext,
+                                                    PersistentIdempotencyContext idempotencyContext,
+                                                    Timer.Sample sample) {
+        return Flux.defer(() -> {
+            try {
+                ReActExecutionResult reactResult = reActAgent.executeDetailed(
+                        question, adaptiveContext.getContext(), optimizedHistory);
+                String answer = reactResult.getAnswer();
+                String persistedAnswer = chatSessionService.recordSuccessfulExchange(
+                        username, sessionId, question, answer,
+                        idempotencyContext, answer, String.class);
+                if (!StringUtils.hasText(optimizedHistory)) {
+                    semanticCacheService.put(cacheNamespace, question, persistedAnswer);
+                }
+                ChatExecutionResult result = ChatExecutionResult.builder()
+                        .answer(persistedAnswer)
+                        .adaptiveRagContext(adaptiveContext)
+                        .cacheHit(false)
+                        .responseSource(determineResponseSource(useRag, adaptiveContext))
+                        .reactTrace(reactResult.getTrace())
+                        .build();
+                recordReActTraceMetrics(reactResult.getTrace());
+                metricsService.recordChat(ChatMode.REACT.metricName, useRag, false, true, sample);
+                return Flux.just(
+                        ChatStreamEvent.token(persistedAnswer),
+                        ChatStreamEvent.done(persistedAnswer, result));
+            } catch (RuntimeException exception) {
+                metricsService.recordChat(ChatMode.REACT.metricName, useRag, false, false, sample);
+                return Flux.error(exception);
+            }
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Flux<ChatStreamEvent> streamModelTokens(String username,
+                                                    String sessionId,
+                                                    String question,
+                                                    boolean useRag,
+                                                    String optimizedHistory,
+                                                    String cacheNamespace,
+                                                    AdaptiveRagContext adaptiveContext,
+                                                    PersistentIdempotencyContext idempotencyContext,
+                                                    Timer.Sample sample) {
+        String fullPrompt = buildPrompt(optimizedHistory, adaptiveContext.getContext(), question);
+
+        Sinks.Many<ChatStreamEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
         StringBuilder responseBuilder = new StringBuilder();
         AtomicBoolean metricsRecorded = new AtomicBoolean(false);
 
@@ -127,27 +215,32 @@ public class AiAgentService {
         } catch (Exception e) {
             log.error("Streaming chat initialization failed", e);
             metricsService.recordChat("stream", useRag, false, false, sample);
-            sink.tryEmitError(e);
-            return sink.asFlux().timeout(Duration.ofMinutes(5));
+            return Flux.error(e);
         }
 
         tokenStream
                 .onNext(token -> {
-                    sink.tryEmitNext(token);
                     responseBuilder.append(token);
+                    sink.tryEmitNext(ChatStreamEvent.token(token));
                 })
                 .onComplete(response -> {
                     try {
-                        String answer = responseBuilder.toString();
-                        answer = chatSessionService.recordSuccessfulExchange(
-                                username, sessionId, question, answer,
-                                idempotencyContext, answer, String.class);
+                        String answer = chatSessionService.recordSuccessfulExchange(
+                                username, sessionId, question, responseBuilder.toString(),
+                                idempotencyContext, responseBuilder.toString(), String.class);
                         if (!StringUtils.hasText(optimizedHistory)) {
                             semanticCacheService.put(cacheNamespace, question, answer);
                         }
                         if (metricsRecorded.compareAndSet(false, true)) {
                             metricsService.recordChat("stream", useRag, false, true, sample);
                         }
+                        ChatExecutionResult result = ChatExecutionResult.builder()
+                                .answer(answer)
+                                .adaptiveRagContext(adaptiveContext)
+                                .cacheHit(false)
+                                .responseSource(determineResponseSource(useRag, adaptiveContext))
+                                .build();
+                        sink.tryEmitNext(ChatStreamEvent.done(answer, result));
                         sink.tryEmitComplete();
                     } catch (RuntimeException exception) {
                         log.error("Failed to persist completed streaming chat", exception);
@@ -345,7 +438,7 @@ public class AiAgentService {
         }
     }
 
-    private enum ChatMode {
+    public enum ChatMode {
         NORMAL("normal"),
         REACT("react");
 

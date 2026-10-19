@@ -157,6 +157,15 @@
             font-size: 12px;
             padding: 6px 12px;
         }
+        .message.assistant.streaming .bubble::after {
+            content: '▌';
+            margin-left: 2px;
+            color: #409eff;
+            animation: cursor-blink 1s step-start infinite;
+        }
+        @keyframes cursor-blink {
+            50% { opacity: 0; }
+        }
         .chat-actions {
             display: flex;
             gap: 10px;
@@ -284,7 +293,7 @@
                 <div class="chat-shell">
                     <div ref="chatBox" class="chat-box">
                         <template v-if="messages.length">
-                            <div v-for="(message, index) in messages" :key="index" class="message" :class="message.role">
+                            <div v-for="(message, index) in messages" :key="index" class="message" :class="[message.role, { streaming: message.streaming }]">
                                 <div class="message-label">{{ message.label }}</div>
                                 <div class="bubble">{{ message.content }}</div>
                             </div>
@@ -557,9 +566,9 @@
                 setStoredDocumentIds(nextIds);
             };
 
-            const appendMessage = (role, content) => {
+            const appendMessage = (role, content, extra = {}) => {
                 const labelMap = { user: '用户', assistant: '助手', system: '系统' };
-                messages.value.push({ role, content, label: labelMap[role] || role });
+                messages.value.push({ role, content, label: labelMap[role] || role, ...extra });
             };
 
             const scrollToBottom = async () => {
@@ -594,24 +603,105 @@
                 appendMessage('user', q);
                 question.value = '';
                 loading.value = true;
+                const assistantIndex = messages.value.length;
+                appendMessage('assistant', '', { streaming: true });
                 await scrollToBottom();
 
+                let reader = null;
+                let streamError = null;
+                let failed = false;
                 try {
-                    let url = `${API_BASE}/chat?sessionId=${encodeURIComponent(sessionId.value)}&question=${encodeURIComponent(q)}&useRag=${useRag.value}`;
-                    let method = 'POST';
-
-                    if (chatMode.value === 'react') {
-                        url = `${API_BASE}/react/chat?sessionId=${encodeURIComponent(sessionId.value)}&question=${encodeURIComponent(q)}&useRag=${useRag.value}`;
-                    } else if (chatMode.value === 'multi-agent') {
-                        url = `${API_BASE}/multi-agent/execute?task=${encodeURIComponent(q)}`;
+                    const payload = new URLSearchParams({
+                        sessionId: sessionId.value,
+                        question: q,
+                        useRag: String(useRag.value),
+                        mode: chatMode.value
+                    });
+                    const res = await fetch(`${API_BASE}/chat/stream`, {
+                        method: 'POST',
+                        headers: {
+                            ...getAuthHeaders(),
+                            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+                        },
+                        body: payload.toString()
+                    });
+                    if (!res.ok) {
+                        const detail = await res.text().catch(() => '');
+                        throw new Error(detail || `HTTP ${res.status}`);
+                    }
+                    if (!res.body) {
+                        throw new Error('当前浏览器不支持流式响应');
                     }
 
-                    const res = await fetch(url, { method, headers: getAuthHeaders() });
-                    const data = await res.json();
-                    appendMessage('assistant', data.answer || data.message || '暂无回答');
+                    reader = res.body.getReader();
+                    const decoder = new TextDecoder('utf-8');
+                    let buffer = '';
+
+                    const handleEvent = (rawEvent) => {
+                        const dataLines = rawEvent
+                            .split('\n')
+                            .filter(line => line.startsWith('data:'))
+                            .map(line => line.slice(5).trimStart());
+                        if (!dataLines.length) return;
+
+                        let event;
+                        try {
+                            event = JSON.parse(dataLines.join('\n'));
+                        } catch {
+                            return;
+                        }
+
+                        const message = messages.value[assistantIndex];
+                        if (!message) return;
+
+                        if (event.type === 'token' && event.content) {
+                            message.content += event.content;
+                            scrollToBottom();
+                        } else if (event.type === 'done') {
+                            if (!message.content && event.answer) {
+                                message.content = event.answer;
+                            }
+                            message.streaming = false;
+                        } else if (event.type === 'error') {
+                            message.streaming = false;
+                            streamError = new Error(event.message || '生成失败');
+                        }
+                    };
+
+                    while (true) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        buffer = (buffer + decoder.decode(chunk.value, { stream: true })).replace(/\r\n/g, '\n');
+                        let boundary;
+                        while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+                            const rawEvent = buffer.slice(0, boundary);
+                            buffer = buffer.slice(boundary + 2);
+                            handleEvent(rawEvent);
+                            if (streamError) throw streamError;
+                        }
+                    }
+                    buffer = (buffer + decoder.decode()).replace(/\r\n/g, '\n');
+                    if (buffer.trim()) {
+                        handleEvent(buffer);
+                    }
+                    if (streamError) throw streamError;
                 } catch (error) {
+                    failed = true;
                     appendMessage('system', '请求失败：' + error.message);
                 } finally {
+                    if (reader) {
+                        reader.cancel().catch(() => {});
+                    }
+                    const message = messages.value[assistantIndex];
+                    if (message) {
+                        message.streaming = false;
+                        if (!message.content) {
+                            messages.value.splice(assistantIndex, 1);
+                            if (!failed) {
+                                appendMessage('system', '请求失败：服务未返回内容');
+                            }
+                        }
+                    }
                     loading.value = false;
                     scrollToBottom();
                 }

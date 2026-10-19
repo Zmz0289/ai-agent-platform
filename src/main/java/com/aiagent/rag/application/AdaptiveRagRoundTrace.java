@@ -21,6 +21,11 @@ public class AdaptiveRagRoundTrace {
     private boolean queryRewritten;
     private String rewriteReason;
 
+    /** 本轮实际参与召回的 query；单 query 时为改写后的 query。 */
+    private List<String> retrievalQueries;
+    /** 查询规划依据或降级原因（gate_skipped / planner_error 等）。 */
+    private String queryPlanReason;
+
     private List<ChunkTrace> retrievedChunks;
     private int chunkCount;
 

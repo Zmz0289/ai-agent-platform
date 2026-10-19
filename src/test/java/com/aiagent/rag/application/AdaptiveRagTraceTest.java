@@ -16,12 +16,14 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class AdaptiveRagTraceTest {
 
     @Mock private MultiRecallService multiRecallService;
+    @Mock private QueryPlanner queryPlanner;
     @Mock private PlatformMetricsService metricsService;
     private AdaptiveRagService adaptiveRagService;
 
@@ -32,11 +34,15 @@ class AdaptiveRagTraceTest {
         aiProperties.getRag().setTopK(5);
         aiProperties.getRag().setSimilarityThreshold(0.7);
         when(metricsService.startSample()).thenReturn(Timer.start());
+        lenient().when(queryPlanner.plan(anyString()))
+                .thenAnswer(invocation -> QueryPlanResult.single(
+                        invocation.getArgument(0), "gate_skipped"));
 
         adaptiveRagService = new AdaptiveRagService(
                 aiProperties, multiRecallService,
                 new QueryRouter(aiProperties),
                 new QueryRewriter(aiProperties),
+                queryPlanner,
                 new SelfRagVerifier(aiProperties),
                 (query, chunks) -> withSemanticScores(chunks, 0.95),
                 metricsService

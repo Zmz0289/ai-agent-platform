@@ -16,7 +16,9 @@ import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -100,104 +102,70 @@ public class MultiRecallService {
                 }
             }
 
-            // === FAQ 优先级联检索（级联第一层）===
-            // FAQ 标准问题命中直接返回（无需混合检索/raw 回退）；未命中继续走 raw 库检索。
-            AiProperties.Milvus milvusConfig = aiProperties.getVectorStore().getMilvus();
-            if (milvusConfig.isFaqFirstEnabled()) {
-                List<RetrievalChunk> faqHits = documentService.searchFaqFirst(
-                        query,
-                        positiveOrDefault(options.getTopK(), 5),
-                        positiveOrDefault(milvusConfig.getFaqTopK(), 3),
-                        milvusConfig.getFaqHitThreshold());
-                if (!faqHits.isEmpty()) {
-                    resultCount = faqHits.size();
-                    log.info("FAQ-first hit: query={} hits={} topScore={}",
-                            query, faqHits.size(), faqHits.get(0).getScore());
-                    if (options.isCacheEnabled()) {
-                        ragCacheService.cacheResults(cacheKeyMaterial, faqHits);
-                    }
-                    return faqHits;
+            List<RetrievalChunk> finalResults = retrieveSingle(query, options);
+            resultCount = finalResults.size();
+            if (options.isCacheEnabled()) {
+                ragCacheService.cacheResults(cacheKeyMaterial, finalResults);
+            }
+            return finalResults;
+        } finally {
+            metricsService.recordRagSearch(cacheHit, resultCount, sample);
+        }
+    }
+
+    /**
+     * 多 query 检索：每条 query 独立走完整单 query 召回（含 FAQ 优先），再按权重 RRF 融合去重。
+     *
+     * <p>用于 L1 查询扩展与 L2 多意图分解；只有一条 query 时退回
+     * {@link #search(String, SearchOptions)}，保证单 query 行为与缓存键完全不变。</p>
+     */
+    public List<RetrievalChunk> searchMulti(List<QuerySpec> queries, int topK) {
+        AiProperties.Rag ragConfig = aiProperties.getRag();
+        return searchMulti(queries, SearchOptions.builder()
+                .topK(topK)
+                .similarityThreshold(ragConfig.getSimilarityThreshold())
+                .hybridSearch(ragConfig.isEnableHybridSearch())
+                .cacheEnabled(true)
+                .build());
+    }
+
+    public List<RetrievalChunk> searchMulti(List<QuerySpec> queries, SearchOptions requestedOptions) {
+        List<QuerySpec> specs = sanitizeQuerySpecs(queries);
+        SearchOptions options = resolveOptions(requestedOptions);
+        if (specs.isEmpty()) {
+            return List.of();
+        }
+        if (specs.size() == 1) {
+            return search(specs.get(0).query(), options);
+        }
+
+        Timer.Sample sample = metricsService.startSample();
+        boolean cacheHit = false;
+        int resultCount = 0;
+        String cacheKeyMaterial = buildMultiCacheKeyMaterial(specs, options);
+
+        try {
+            if (options.isCacheEnabled()) {
+                List<RetrievalChunk> cached = ragCacheService.getCachedResults(cacheKeyMaterial);
+                if (cached != null) {
+                    cacheHit = true;
+                    resultCount = Math.min(cached.size(), options.getTopK());
+                    log.debug("Multi-query RAG cache hit for queryCount={}, size={}", specs.size(), cached.size());
+                    return limit(cached, options.getTopK());
                 }
-                log.debug("FAQ-first miss for query={}, falling back to raw retrieval", query);
             }
 
-            List<RetrievalChunk> finalResults;
-            if (options.isHybridSearch()) {
-                AiProperties.Rag ragConfig = aiProperties.getRag();
-                int vectorCandidateTopK = positiveOrDefault(ragConfig.getHybridVectorCandidateTopK(), 20);
-                int bm25CandidateTopK = positiveOrDefault(ragConfig.getHybridBm25CandidateTopK(), 20);
-                int mysqlCandidateTopK = positiveOrDefault(ragConfig.getHybridMysqlCandidateTopK(), 50);
-                CompletableFuture<List<RetrievalChunk>> lexicalFuture = startLexicalSearch(
-                        query, mysqlCandidateTopK, ragConfig.isHybridMysqlFulltextEnabled());
-                int fallbackVectorTopK = Math.max(50, Math.max(vectorCandidateTopK, bm25CandidateTopK));
-                int vectorSearchTopK = ragConfig.isHybridMysqlFulltextEnabled()
-                        ? options.getTopK()
-                        : fallbackVectorTopK;
-                List<RetrievalChunk> stableVectorResults;
-                List<RetrievalChunk> vectorResults;
-                if (ragConfig.isHybridCrossEncoderEnabled() && vectorCandidateTopK > vectorSearchTopK) {
-                    Map<Integer, List<RetrievalChunk>> vectorBatches = vectorSearch(
-                            query,
-                            List.of(vectorSearchTopK, vectorCandidateTopK),
-                            options.getSimilarityThreshold());
-                    stableVectorResults = vectorBatches.getOrDefault(vectorSearchTopK, List.of());
-                    vectorResults = mergeCandidates(
-                            stableVectorResults,
-                            vectorBatches.getOrDefault(vectorCandidateTopK, List.of()));
-                } else {
-                    stableVectorResults = vectorSearch(
-                            query, vectorSearchTopK, options.getSimilarityThreshold());
-                    vectorResults = stableVectorResults;
-                }
-                log.debug("Vector result size={}, stable vector size={}",
-                        vectorResults.size(), stableVectorResults.size());
-
-                List<RetrievalChunk> lexicalResults = awaitLexicalResults(lexicalFuture);
-                if (lexicalResults.isEmpty() && ragConfig.isHybridCorpusBm25Enabled()) {
-                    lexicalResults = bm25SearchCorpus(
-                            query,
-                            bm25CandidateTopK,
-                            ragConfig.isBm25StopwordEnabled(),
-                            positiveOrDefault(ragConfig.getHybridBm25CorpusMaxDocs(), 5000));
-                }
-                if (lexicalResults.isEmpty()) {
-                    log.debug("Corpus BM25 disabled or unavailable, using candidate-pool BM25");
-                    if (vectorSearchTopK < fallbackVectorTopK) {
-                        vectorResults = vectorSearch(
-                                query, fallbackVectorTopK, options.getSimilarityThreshold());
-                    }
-                    lexicalResults = bm25SearchOnCandidates(
-                            query, vectorResults, bm25CandidateTopK,
-                            ragConfig.isBm25StopwordEnabled());
-                }
-                log.debug("Lexical result size={}", lexicalResults.size());
-
-                List<RetrievalChunk> rrfResults = rrfFuse(
-                        List.of(vectorResults, lexicalResults),
-                        Math.max(options.getTopK(), ragConfig.getHybridRerankCandidateTopK()),
-                        ragConfig.getHybridVectorWeight(),
-                        ragConfig.getHybridBm25Weight(),
-                        ragConfig.getHybridRrfK(),
-                        ragConfig.getHybridPreserveVectorTopK());
-                finalResults = ragConfig.isHybridCrossEncoderEnabled()
-                        ? crossEncoderRerank(
-                                query,
-                                stableVectorResults,
-                                vectorResults,
-                                lexicalResults,
-                                rrfResults,
-                                options.getTopK(),
-                                ragConfig.getHybridPreserveVectorTopK(),
-                                ragConfig.getHybridRerankCandidateTopK(),
-                                ragConfig.isHybridRerankFailOpen())
-                        : limit(rrfResults, options.getTopK());
-                log.debug("RRF fused result size={}", finalResults.size());
-            } else {
-                finalResults = annotateVectorOnly(
-                        vectorSearch(query, options.getTopK(), options.getSimilarityThreshold()),
-                        options.getTopK());
-                log.debug("Vector-only result size={}", finalResults.size());
-            }
+            SearchOptions perQueryOptions = SearchOptions.builder()
+                    .topK(resolvePerQueryTopK(options.getTopK()))
+                    .similarityThreshold(options.getSimilarityThreshold())
+                    .hybridSearch(options.isHybridSearch())
+                    .cacheEnabled(false)
+                    .build();
+            List<List<RetrievalChunk>> perQueryResults = retrieveInParallel(specs, perQueryOptions);
+            List<RetrievalChunk> fused = fuseQueryResults(specs, perQueryResults,
+                    positiveOrDefault(aiProperties.getRag().getHybridRrfK(), 60));
+            List<RetrievalChunk> finalResults = rerankFusedQueries(
+                    specs.get(0).query(), fused, options.getTopK());
 
             resultCount = finalResults.size();
             if (options.isCacheEnabled()) {
@@ -207,6 +175,107 @@ public class MultiRecallService {
         } finally {
             metricsService.recordRagSearch(cacheHit, resultCount, sample);
         }
+    }
+
+    /**
+     * 单 query 召回：FAQ 优先级联 -> 混合/向量检索。不读写缓存、不记录指标。
+     */
+    private List<RetrievalChunk> retrieveSingle(String query, SearchOptions options) {
+        // === FAQ 优先级联检索（级联第一层）===
+        // FAQ 标准问题命中直接返回（无需混合检索/raw 回退）；未命中继续走 raw 库检索。
+        AiProperties.Milvus milvusConfig = aiProperties.getVectorStore().getMilvus();
+        if (milvusConfig.isFaqFirstEnabled()) {
+            List<RetrievalChunk> faqHits = documentService.searchFaqFirst(
+                    query,
+                    positiveOrDefault(options.getTopK(), 5),
+                    positiveOrDefault(milvusConfig.getFaqTopK(), 3),
+                    milvusConfig.getFaqHitThreshold());
+            if (!faqHits.isEmpty()) {
+                log.info("FAQ-first hit: query={} hits={} topScore={}",
+                        query, faqHits.size(), faqHits.get(0).getScore());
+                return faqHits;
+            }
+            log.debug("FAQ-first miss for query={}, falling back to raw retrieval", query);
+        }
+
+        List<RetrievalChunk> finalResults;
+        if (options.isHybridSearch()) {
+            AiProperties.Rag ragConfig = aiProperties.getRag();
+            int vectorCandidateTopK = positiveOrDefault(ragConfig.getHybridVectorCandidateTopK(), 20);
+            int bm25CandidateTopK = positiveOrDefault(ragConfig.getHybridBm25CandidateTopK(), 20);
+            int mysqlCandidateTopK = positiveOrDefault(ragConfig.getHybridMysqlCandidateTopK(), 50);
+            CompletableFuture<List<RetrievalChunk>> lexicalFuture = startLexicalSearch(
+                    query, mysqlCandidateTopK, ragConfig.isHybridMysqlFulltextEnabled());
+            int fallbackVectorTopK = Math.max(50, Math.max(vectorCandidateTopK, bm25CandidateTopK));
+            int vectorSearchTopK = ragConfig.isHybridMysqlFulltextEnabled()
+                    ? options.getTopK()
+                    : fallbackVectorTopK;
+            List<RetrievalChunk> stableVectorResults;
+            List<RetrievalChunk> vectorResults;
+            if (ragConfig.isHybridCrossEncoderEnabled() && vectorCandidateTopK > vectorSearchTopK) {
+                Map<Integer, List<RetrievalChunk>> vectorBatches = vectorSearch(
+                        query,
+                        List.of(vectorSearchTopK, vectorCandidateTopK),
+                        options.getSimilarityThreshold());
+                stableVectorResults = vectorBatches.getOrDefault(vectorSearchTopK, List.of());
+                vectorResults = mergeCandidates(
+                        stableVectorResults,
+                        vectorBatches.getOrDefault(vectorCandidateTopK, List.of()));
+            } else {
+                stableVectorResults = vectorSearch(
+                        query, vectorSearchTopK, options.getSimilarityThreshold());
+                vectorResults = stableVectorResults;
+            }
+            log.debug("Vector result size={}, stable vector size={}",
+                    vectorResults.size(), stableVectorResults.size());
+
+            List<RetrievalChunk> lexicalResults = awaitLexicalResults(lexicalFuture);
+            if (lexicalResults.isEmpty() && ragConfig.isHybridCorpusBm25Enabled()) {
+                lexicalResults = bm25SearchCorpus(
+                        query,
+                        bm25CandidateTopK,
+                        ragConfig.isBm25StopwordEnabled(),
+                        positiveOrDefault(ragConfig.getHybridBm25CorpusMaxDocs(), 5000));
+            }
+            if (lexicalResults.isEmpty()) {
+                log.debug("Corpus BM25 disabled or unavailable, using candidate-pool BM25");
+                if (vectorSearchTopK < fallbackVectorTopK) {
+                    vectorResults = vectorSearch(
+                            query, fallbackVectorTopK, options.getSimilarityThreshold());
+                }
+                lexicalResults = bm25SearchOnCandidates(
+                        query, vectorResults, bm25CandidateTopK,
+                        ragConfig.isBm25StopwordEnabled());
+            }
+            log.debug("Lexical result size={}", lexicalResults.size());
+
+            List<RetrievalChunk> rrfResults = rrfFuse(
+                    List.of(vectorResults, lexicalResults),
+                    Math.max(options.getTopK(), ragConfig.getHybridRerankCandidateTopK()),
+                    ragConfig.getHybridVectorWeight(),
+                    ragConfig.getHybridBm25Weight(),
+                    ragConfig.getHybridRrfK(),
+                    ragConfig.getHybridPreserveVectorTopK());
+            finalResults = ragConfig.isHybridCrossEncoderEnabled()
+                    ? crossEncoderRerank(
+                            query,
+                            stableVectorResults,
+                            vectorResults,
+                            lexicalResults,
+                            rrfResults,
+                            options.getTopK(),
+                            ragConfig.getHybridPreserveVectorTopK(),
+                            ragConfig.getHybridRerankCandidateTopK(),
+                            ragConfig.isHybridRerankFailOpen())
+                    : limit(rrfResults, options.getTopK());
+            log.debug("RRF fused result size={}", finalResults.size());
+        } else {
+            finalResults = annotateVectorOnly(
+                    vectorSearch(query, options.getTopK(), options.getSimilarityThreshold()),
+                    options.getTopK());
+            log.debug("Vector-only result size={}", finalResults.size());
+        }
+        return finalResults;
     }
 
     private SearchOptions resolveOptions(SearchOptions options) {
@@ -256,6 +325,186 @@ public class MultiRecallService {
                         "|cross=true|rerankTopK=%d|rerankFailOpen=%s",
                         aiProperties.getRag().getHybridRerankCandidateTopK(),
                         aiProperties.getRag().isHybridRerankFailOpen());
+    }
+
+    private String buildMultiCacheKeyMaterial(List<QuerySpec> specs, SearchOptions options) {
+        String composite = "multi:" + specs.stream()
+                .map(spec -> String.format(Locale.ROOT, "%.3f", spec.weight()) + ":" + spec.query())
+                .collect(Collectors.joining("\u0001"));
+        return buildCacheKeyMaterial(composite, options);
+    }
+
+    private List<QuerySpec> sanitizeQuerySpecs(List<QuerySpec> queries) {
+        if (queries == null || queries.isEmpty()) {
+            return List.of();
+        }
+        int maxQueries = Math.max(1, aiProperties.getRag().getQueryPlan().getMaxQueries());
+        LinkedHashMap<String, QuerySpec> unique = new LinkedHashMap<>();
+        for (QuerySpec spec : queries) {
+            if (spec == null || !StringUtils.hasText(spec.query())) {
+                continue;
+            }
+            String normalized = spec.query().trim().replaceAll("\\s+", " ");
+            unique.putIfAbsent(normalized.toLowerCase(Locale.ROOT),
+                    new QuerySpec(normalized, spec.kind(), spec.weight()));
+            if (unique.size() >= maxQueries) {
+                break;
+            }
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private int resolvePerQueryTopK(int topK) {
+        int configured = aiProperties.getRag().getQueryPlan().getPerQueryTopK();
+        if (configured > 0) {
+            return configured;
+        }
+        return Math.max(10, topK * 2);
+    }
+
+    private List<List<RetrievalChunk>> retrieveInParallel(List<QuerySpec> specs,
+                                                          SearchOptions perQueryOptions) {
+        List<CompletableFuture<List<RetrievalChunk>>> futures = new ArrayList<>(specs.size());
+        for (QuerySpec spec : specs) {
+            try {
+                futures.add(CompletableFuture.supplyAsync(
+                        () -> retrieveSingle(spec.query(), perQueryOptions), ioTaskExecutor));
+            } catch (RuntimeException schedulingFailure) {
+                log.warn("Unable to schedule multi-query retrieval, running inline: {}",
+                        schedulingFailure.getMessage());
+                try {
+                    futures.add(CompletableFuture.completedFuture(
+                            retrieveSingle(spec.query(), perQueryOptions)));
+                } catch (RuntimeException executionFailure) {
+                    futures.add(CompletableFuture.failedFuture(executionFailure));
+                }
+            }
+        }
+
+        List<List<RetrievalChunk>> results = new ArrayList<>(specs.size());
+        KnowledgeRetrievalUnavailableException unavailable = null;
+        for (CompletableFuture<List<RetrievalChunk>> future : futures) {
+            try {
+                List<RetrievalChunk> chunks = future.join();
+                results.add(chunks == null ? List.of() : chunks);
+            } catch (CompletionException exception) {
+                Throwable cause = exception.getCause();
+                if (cause instanceof KnowledgeRetrievalUnavailableException retrievalUnavailable) {
+                    unavailable = retrievalUnavailable;
+                } else {
+                    log.warn("Multi-query retrieval failed for one query: {}",
+                            cause == null ? exception.getMessage() : cause.getMessage());
+                }
+                results.add(List.of());
+            }
+        }
+        if (unavailable != null && results.stream().allMatch(List::isEmpty)) {
+            throw unavailable;
+        }
+        return results;
+    }
+
+    /**
+     * 多路加权 RRF：同一 chunk 在不同 query 下命中会累加，原问题权重最高。
+     */
+    private List<RetrievalChunk> fuseQueryResults(List<QuerySpec> specs,
+                                                  List<List<RetrievalChunk>> perQueryResults,
+                                                  int rrfK) {
+        Map<String, Double> fusedScores = new HashMap<>();
+        Map<String, RetrievalChunk> documents = new LinkedHashMap<>();
+        Map<String, List<String>> matchedQueries = new HashMap<>();
+        Map<String, Integer> hitCounts = new HashMap<>();
+
+        for (int queryIndex = 0; queryIndex < perQueryResults.size(); queryIndex++) {
+            QuerySpec spec = specs.get(queryIndex);
+            double weight = positiveOrDefault(spec.weight(), 1.0);
+            List<RetrievalChunk> chunks = perQueryResults.get(queryIndex);
+            for (int rank = 0; rank < chunks.size(); rank++) {
+                RetrievalChunk chunk = chunks.get(rank);
+                if (chunk == null || chunk.getId() == null) {
+                    continue;
+                }
+                documents.putIfAbsent(chunk.getId(), chunk);
+                fusedScores.merge(chunk.getId(), weight / (rrfK + rank + 1), Double::sum);
+                List<String> matched = matchedQueries.computeIfAbsent(
+                        chunk.getId(), key -> new ArrayList<>(4));
+                if (matched.size() < 3 && !matched.contains(spec.query())) {
+                    matched.add(spec.query());
+                }
+                hitCounts.merge(chunk.getId(), 1, Integer::sum);
+            }
+        }
+
+        return fusedScores.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed()
+                        .thenComparing(Map.Entry::getKey))
+                .map(entry -> {
+                    RetrievalChunk chunk = documents.get(entry.getKey());
+                    Map<String, Object> metadata = new LinkedHashMap<>();
+                    if (chunk.getMetadata() != null) {
+                        metadata.putAll(chunk.getMetadata());
+                    }
+                    metadata.put("queryFusionScore", entry.getValue());
+                    metadata.put("queryHitCount", hitCounts.getOrDefault(entry.getKey(), 1));
+                    metadata.put("matchedQueries",
+                            List.copyOf(matchedQueries.getOrDefault(entry.getKey(), List.of())));
+                    return RetrievalChunk.builder()
+                            .id(chunk.getId())
+                            .content(chunk.getContent())
+                            .score(entry.getValue())
+                            .metadata(metadata)
+                            .build();
+                })
+                .toList();
+    }
+
+    /**
+     * 融合后按原问题做 cross-encoder 重排（可选），失败时按融合顺序降级。
+     */
+    private List<RetrievalChunk> rerankFusedQueries(String query, List<RetrievalChunk> fused, int topK) {
+        if (fused.isEmpty()) {
+            return List.of();
+        }
+        AiProperties.Rag ragConfig = aiProperties.getRag();
+        if (!ragConfig.isHybridCrossEncoderEnabled()
+                || !ragConfig.getQueryPlan().isRerankWithCrossEncoder()) {
+            return limit(fused, topK);
+        }
+
+        List<RetrievalChunk> candidates = limit(fused,
+                positiveOrDefault(ragConfig.getHybridRerankCandidateTopK(), 25));
+        try {
+            List<CrossEncoderRerankClient.RerankScore> scores = crossEncoderRerankClient.rerank(
+                    query, candidates.stream().map(RetrievalChunk::getContent).toList());
+            if (scores == null || scores.size() != candidates.size()) {
+                throw new IllegalStateException("Cross-encoder did not score every fused candidate");
+            }
+            Map<Integer, Double> scoreByIndex = new HashMap<>();
+            for (CrossEncoderRerankClient.RerankScore score : scores) {
+                if (score == null || score.index() < 0 || score.index() >= candidates.size()
+                        || !Double.isFinite(score.score()) || score.score() < 0.0 || score.score() > 1.0
+                        || scoreByIndex.putIfAbsent(score.index(), score.score()) != null) {
+                    throw new IllegalStateException("Cross-encoder returned invalid fused candidate scores");
+                }
+            }
+            if (scoreByIndex.size() != candidates.size()) {
+                throw new IllegalStateException("Cross-encoder omitted fused candidate scores");
+            }
+            return java.util.stream.IntStream.range(0, candidates.size())
+                    .mapToObj(index -> withRerankMetadata(
+                            candidates.get(index), scoreByIndex.get(index), index + 1))
+                    .sorted(java.util.Comparator.comparingDouble(RetrievalChunk::getScore).reversed()
+                            .thenComparing(RetrievalChunk::getId))
+                    .limit(topK)
+                    .toList();
+        } catch (RuntimeException exception) {
+            if (!ragConfig.isHybridRerankFailOpen()) {
+                throw exception;
+            }
+            log.warn("Multi-query cross-encoder reranking failed; using fusion order: {}",
+                    exception.getMessage());
+            return limit(fused, topK);
+        }
     }
 
     private List<RetrievalChunk> crossEncoderRerank(String query,
@@ -629,6 +878,16 @@ public class MultiRecallService {
             return stopwordEnabled != requestedStopwordEnabled
                     || maxDocs != requestedMaxDocs
                     || System.currentTimeMillis() - builtAtMillis > CORPUS_INDEX_TTL_MS;
+        }
+    }
+
+    /**
+     * 一路检索 query。{@code kind} 仅用于 trace/排查（original/sub_question/expansion/feedback），
+     * {@code weight} 参与多路融合，原问题权重最高。
+     */
+    public record QuerySpec(String query, String kind, double weight) {
+        public QuerySpec(String query) {
+            this(query, "original", 1.0);
         }
     }
 

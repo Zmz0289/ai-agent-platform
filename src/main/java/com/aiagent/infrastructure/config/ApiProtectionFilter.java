@@ -179,8 +179,8 @@ public class ApiProtectionFilter extends OncePerRequestFilter {
     private boolean isProtectedRequest(HttpServletRequest request) {
         String path = request.getRequestURI();
         String method = request.getMethod();
-        if ("GET".equalsIgnoreCase(method) && "/api/v1/agent/chat/stream".equals(path)) {
-            return true;
+        if ("/api/v1/agent/chat/stream".equals(path)) {
+            return "GET".equalsIgnoreCase(method) || "POST".equalsIgnoreCase(method);
         }
         return "POST".equalsIgnoreCase(method) && PROTECTED_POST_PATHS.contains(path);
     }

@@ -175,6 +175,45 @@ public class AiProperties {
         private boolean hybridRerankFailOpen = true;
         private boolean bm25StopwordEnabled = true;
         private Adaptive adaptive = new Adaptive();
+        /** L1 查询扩展 + L2 多意图分解（规则门控 + 单次 LLM 调用）。 */
+        private QueryPlan queryPlan = new QueryPlan();
+    }
+
+    /**
+     * 检索查询规划：先用便宜规则判断是否值得调用 LLM，再由一次 LLM 调用同时产出
+     * L1 同义/改写检索式与 L2 独立子问题，最后多路召回并按权重 RRF 融合。
+     */
+    @Data
+    public static class QueryPlan {
+        /** 总开关；关闭后完全退回单 query 检索。 */
+        private boolean enabled = true;
+        /** L1：生成同义/改写检索式以提升召回。 */
+        private boolean expansionEnabled = true;
+        /** L2：把多意图问题拆成独立子问题分别召回。 */
+        private boolean decompositionEnabled = true;
+        /** 参与检索的 query 总数上限（含原问题）。 */
+        private int maxQueries = 5;
+        /** L1 扩展检索式条数上限。 */
+        private int maxExpansions = 2;
+        /** L2 子问题条数上限。 */
+        private int maxSubQueries = 3;
+        /** 问题长度达到该值才考虑调用 planner。 */
+        private int gateMinLength = 30;
+        /** 问号数量达到该值视为多意图，触发 planner。 */
+        private int gateMinQuestionMarks = 2;
+        /** 命中并列连词且达到该长度时触发 planner。 */
+        private int gateMinHintLength = 12;
+        /** 每条 query 的召回条数；<=0 时按 max(10, topK*2) 自适应。 */
+        private int perQueryTopK = 0;
+        /** RRF 融合权重：原问题 / 子问题 / 扩展检索式 / 重试轮改写 query。 */
+        private double originalWeight = 1.0;
+        private double subQueryWeight = 0.85;
+        private double expansionWeight = 0.6;
+        private double feedbackWeight = 0.75;
+        /** 查询规划 LLM 调用超时（毫秒）。 */
+        private int llmTimeoutMs = 8000;
+        /** 融合后是否按原问题再做一次 cross-encoder 重排（需 hybridCrossEncoderEnabled）。 */
+        private boolean rerankWithCrossEncoder = true;
     }
 
     /** Controls the router -> rewrite -> retrieve -> verify loop. */

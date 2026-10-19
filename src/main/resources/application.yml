@@ -157,6 +157,24 @@ ai:
     hybrid-rerank-candidate-top-k: ${AI_RAG_HYBRID_RERANK_CANDIDATE_TOP_K:40}
     hybrid-rerank-fail-open: ${AI_RAG_HYBRID_RERANK_FAIL_OPEN:true}
     bm25-stopword-enabled: ${AI_RAG_BM25_STOPWORD_ENABLED:true}
+    # L1 查询扩展 + L2 多意图分解：先用规则门控，命中后一次 LLM 调用产出多路检索式
+    query-plan:
+      enabled: ${AI_RAG_QUERY_PLAN_ENABLED:true}
+      expansion-enabled: ${AI_RAG_QUERY_PLAN_EXPANSION_ENABLED:true}
+      decomposition-enabled: ${AI_RAG_QUERY_PLAN_DECOMPOSITION_ENABLED:true}
+      max-queries: ${AI_RAG_QUERY_PLAN_MAX_QUERIES:5}
+      max-expansions: ${AI_RAG_QUERY_PLAN_MAX_EXPANSIONS:2}
+      max-sub-queries: ${AI_RAG_QUERY_PLAN_MAX_SUB_QUERIES:3}
+      gate-min-length: ${AI_RAG_QUERY_PLAN_GATE_MIN_LENGTH:30}
+      gate-min-question-marks: ${AI_RAG_QUERY_PLAN_GATE_MIN_QUESTION_MARKS:2}
+      gate-min-hint-length: ${AI_RAG_QUERY_PLAN_GATE_MIN_HINT_LENGTH:12}
+      per-query-top-k: ${AI_RAG_QUERY_PLAN_PER_QUERY_TOP_K:0}
+      original-weight: ${AI_RAG_QUERY_PLAN_ORIGINAL_WEIGHT:1.0}
+      sub-query-weight: ${AI_RAG_QUERY_PLAN_SUB_QUERY_WEIGHT:0.85}
+      expansion-weight: ${AI_RAG_QUERY_PLAN_EXPANSION_WEIGHT:0.6}
+      feedback-weight: ${AI_RAG_QUERY_PLAN_FEEDBACK_WEIGHT:0.75}
+      llm-timeout-ms: ${AI_RAG_QUERY_PLAN_LLM_TIMEOUT_MS:8000}
+      rerank-with-cross-encoder: ${AI_RAG_QUERY_PLAN_RERANK_WITH_CROSS_ENCODER:true}
     adaptive:
       enabled: true
       max-retrieval-rounds: 2

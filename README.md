@@ -131,7 +131,15 @@ curl http://localhost:8081/api/v1/agent/health
 curl -X POST http://localhost:8081/api/v1/agent/session
 curl -X POST "http://localhost:8081/api/v1/agent/chat?sessionId={sessionId}&question=订单如何申请退款？&useRag=true"
 
-# SSE 流式响应
+# SSE 流式响应（POST 表单参数，事件体为 JSON：token / done / error）
+curl -N -X POST "http://localhost:8081/api/v1/agent/chat/stream" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "sessionId={sessionId}" \
+  --data-urlencode "question=请介绍RAG技术" \
+  --data-urlencode "mode=normal" \
+  --data-urlencode "useRag=true"
+
+# 兼容旧版 GET 流式接口（直接返回文本增量）
 curl -N "http://localhost:8081/api/v1/agent/chat/stream?sessionId={sessionId}&question=请介绍RAG技术"
 ```
 

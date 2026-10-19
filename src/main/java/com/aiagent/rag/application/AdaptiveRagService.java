@@ -35,6 +35,7 @@ package com.aiagent.rag.application;
         private final MultiRecallService multiRecallService;
         private final QueryRouter queryRouter;
         private final QueryRewriter queryRewriter;
+        private final QueryPlanner queryPlanner;
         private final SelfRagVerifier selfRagVerifier;
         private final EvidenceReranker evidenceReranker;
         private final PlatformMetricsService metricsService;
@@ -65,17 +66,29 @@ package com.aiagent.rag.application;
                 int maxRounds = resolveMaxRounds(decision);
                 int actualRounds = 0;
                 List<AdaptiveRagRoundTrace> roundTraces = new ArrayList<>();
+                QueryPlanResult queryPlan = queryPlanner.plan(question);
+                if (queryPlan.isMultiQuery()) {
+                    log.debug("Query plan resolved: subQueries={}, expansions={}, reason={}",
+                            queryPlan.getSubQueries(), queryPlan.getExpansions(), queryPlan.getReason());
+                }
 
                 for (int attempt = 1; attempt <= maxRounds; attempt++) {
                     actualRounds = attempt;
                     rewriteResult = queryRewriter.rewrite(question, decision, verificationResult);
-                    chunks = multiRecallService.search(rewriteResult.getRewrittenQuery(), aiProperties.getRag().getTopK());
-                    chunks = evidenceReranker.rerank(rewriteResult.getRewrittenQuery(), chunks);
+                    List<MultiRecallService.QuerySpec> retrievalSpecs =
+                            buildRetrievalSpecs(queryPlan, rewriteResult, attempt);
+                    boolean multiQuery = retrievalSpecs.size() > 1;
+                    chunks = multiQuery
+                            ? multiRecallService.searchMulti(retrievalSpecs, aiProperties.getRag().getTopK())
+                            : multiRecallService.search(rewriteResult.getRewrittenQuery(), aiProperties.getRag().getTopK());
+                    String rerankQuery = multiQuery ? question : rewriteResult.getRewrittenQuery();
+                    chunks = evidenceReranker.rerank(rerankQuery, chunks);
                     verificationResult = selfRagVerifier.verify(question, rewriteResult, chunks, decision.getRouteType());
 
                     boolean terminal = isTerminal(verificationResult, attempt, maxRounds);
                     String terminalReason = determineTerminalReason(verificationResult, terminal);
-                    roundTraces.add(buildRoundTrace(attempt, rewriteResult, chunks, verificationResult, terminal, terminalReason));
+                    roundTraces.add(buildRoundTrace(attempt, rewriteResult, chunks, verificationResult,
+                            terminal, terminalReason, retrievalSpecs, queryPlan));
 
                     if (terminal) {
                         break;
@@ -189,7 +202,9 @@ package com.aiagent.rag.application;
                                                       List<RetrievalChunk> chunks,
                                                       AdaptiveRagVerificationResult verificationResult,
                                                       boolean terminal,
-                                                      String terminalReason) {
+                                                      String terminalReason,
+                                                      List<MultiRecallService.QuerySpec> retrievalSpecs,
+                                                      QueryPlanResult queryPlan) {
             List<AdaptiveRagRoundTrace.ChunkTrace> chunkTraces = new ArrayList<>();
             for (RetrievalChunk chunk : chunks) {
                 Map<String, Object> metadata = chunk.getMetadata();
@@ -210,12 +225,18 @@ package com.aiagent.rag.application;
                         .build());
             }
 
+            List<String> retrievalQueries = retrievalSpecs.size() > 1
+                    ? retrievalSpecs.stream().map(MultiRecallService.QuerySpec::query).toList()
+                    : List.of(rewriteResult.getRewrittenQuery());
+
             return AdaptiveRagRoundTrace.builder()
                     .round(round)
                     .rewrittenQuery(rewriteResult.getRewrittenQuery())
                     .keywords(rewriteResult.getKeywords())
                     .queryRewritten(rewriteResult.isChanged())
                     .rewriteReason(rewriteResult.getReason())
+                    .retrievalQueries(retrievalQueries)
+                    .queryPlanReason(queryPlan == null ? null : queryPlan.getReason())
                     .retrievedChunks(chunkTraces)
                     .chunkCount(chunks.size())
                     .verificationLevel(verificationResult.getLevel())
@@ -229,6 +250,43 @@ package com.aiagent.rag.application;
                     .terminal(terminal)
                     .terminalReason(terminalReason)
                     .build();
+        }
+
+        private List<MultiRecallService.QuerySpec> buildRetrievalSpecs(QueryPlanResult queryPlan,
+                                                                       AdaptiveRagRewriteResult rewriteResult,
+                                                                       int attempt) {
+            if (queryPlan == null || !queryPlan.isMultiQuery()) {
+                return List.of();
+            }
+            AiProperties.QueryPlan config = aiProperties.getRag().getQueryPlan();
+            Map<String, MultiRecallService.QuerySpec> specs = new java.util.LinkedHashMap<>();
+            addQuerySpec(specs, queryPlan.getOriginalQuery(), "original", config.getOriginalWeight());
+            if (queryPlan.getSubQueries() != null) {
+                for (String subQuery : queryPlan.getSubQueries()) {
+                    addQuerySpec(specs, subQuery, "sub_question", config.getSubQueryWeight());
+                }
+            }
+            if (queryPlan.getExpansions() != null) {
+                for (String expansion : queryPlan.getExpansions()) {
+                    addQuerySpec(specs, expansion, "expansion", config.getExpansionWeight());
+                }
+            }
+            if (attempt > 1 && rewriteResult != null) {
+                addQuerySpec(specs, rewriteResult.getRewrittenQuery(), "feedback", config.getFeedbackWeight());
+            }
+            return List.copyOf(specs.values());
+        }
+
+        private void addQuerySpec(Map<String, MultiRecallService.QuerySpec> specs,
+                                  String query,
+                                  String kind,
+                                  double weight) {
+            if (!StringUtils.hasText(query)) {
+                return;
+            }
+            String normalized = query.trim();
+            specs.putIfAbsent(normalized.toLowerCase(java.util.Locale.ROOT),
+                    new MultiRecallService.QuerySpec(normalized, kind, weight));
         }
 
         private String metadataText(Map<String, Object> metadata, String key) {

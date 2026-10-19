@@ -2,11 +2,13 @@ package com.aiagent.agent.api;
 
 import com.aiagent.agent.application.AiAgentService;
 import com.aiagent.agent.application.ChatExecutionResult;
+import com.aiagent.agent.application.ChatStreamEvent;
 import com.aiagent.agent.application.MultiAgentExecutionResult;
 import com.aiagent.agent.application.MultiAgentService;
 import com.aiagent.chat.application.ChatMessageView;
 import com.aiagent.rag.application.AdaptiveRagContext;
 import com.aiagent.rag.application.AdaptiveRagRoundTrace;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.aiagent.infrastructure.cache.SemanticCacheService;
@@ -18,9 +20,11 @@ import com.aiagent.rag.application.EvaluationReportHistoryService;
 import com.aiagent.rag.application.RagEvaluationService;
 import com.aiagent.shared.exception.AuthenticationRequiredException;
 import java.time.Instant;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.util.StringUtils;
@@ -35,6 +39,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -42,12 +47,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/v1/agent")
 public class AiAgentController {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String EVALUATION_NOTE = "chunkSize/chunkOverlap are snapshot-only and require re-ingestion for fair comparison";
+    private static final String MODE_NORMAL = "normal";
+    private static final String MODE_REACT = "react";
+    private static final String MODE_MULTI_AGENT = "multi-agent";
 
     private final AiAgentService aiAgentService;
     private final DocumentService documentService;
@@ -151,7 +160,7 @@ public class AiAgentController {
                                 question,
                                 aiAgentService.chat(
                                         username, sessionId, question, useRag, persistentContext),
-                                "react"
+                                "normal"
                         );
                     }
 
@@ -248,6 +257,156 @@ public class AiAgentController {
                         operation, idempotencyKey, requestHash, claim.ownerToken()));
     }
 
+
+    /**
+     * 统一流式对话接口：SSE 数据体为 JSON，{@code token} 增量输出文本，{@code done} 结束并携带 explain 元数据。
+     */
+    @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<String>> streamChatPost(
+            @RequestParam String sessionId,
+            @RequestParam String question,
+            @RequestParam(defaultValue = "true") boolean useRag,
+            @RequestParam(defaultValue = "normal") String mode,
+            @RequestParam(defaultValue = "false") boolean explain,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            Authentication authentication) {
+        String username = requireUsername(authentication);
+        String normalizedMode = normalizeChatMode(mode);
+        String requestHash = requestFingerprint(username, "stream", sessionId, question,
+                Boolean.toString(useRag), normalizedMode);
+        PersistentIdempotencyContext persistentContext = persistentContext(
+                "agent-chat-stream", idempotencyKey, requestHash);
+
+        Supplier<Flux<ChatStreamEvent>> events;
+        if (MODE_MULTI_AGENT.equals(normalizedMode)) {
+            requireAdmin(authentication);
+            events = () -> streamMultiAgentEvents(question);
+        } else {
+            AiAgentService.ChatMode chatMode = MODE_REACT.equals(normalizedMode)
+                    ? AiAgentService.ChatMode.REACT
+                    : AiAgentService.ChatMode.NORMAL;
+            events = () -> aiAgentService.streamChatEvents(
+                    username, sessionId, question, useRag, chatMode, persistentContext);
+        }
+
+        return streamWithIdempotency(
+                userScopedOperation("agent-chat-stream", username),
+                idempotencyKey,
+                requestHash,
+                explain,
+                normalizedMode,
+                events);
+    }
+
+    /**
+     * Multi-Agent 由规划、并行执行、汇总三步组成，只能等最终答案产出后整体下发。
+     */
+    private Flux<ChatStreamEvent> streamMultiAgentEvents(String task) {
+        return Flux.defer(() -> {
+            MultiAgentExecutionResult result = multiAgentService.executeDetailed(task, "");
+            String answer = result.getAnswer() == null ? "" : result.getAnswer();
+            return Flux.just(
+                    ChatStreamEvent.token(answer),
+                    ChatStreamEvent.done(answer, null, result.getTrace()));
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private Flux<ServerSentEvent<String>> streamWithIdempotency(String operation,
+                                                                String idempotencyKey,
+                                                                String requestHash,
+                                                                boolean explain,
+                                                                String mode,
+                                                                Supplier<Flux<ChatStreamEvent>> events) {
+        if (!StringUtils.hasText(idempotencyKey)) {
+            return toSse(events.get(), explain, mode);
+        }
+        if (idempotencyService == null) {
+            throw new IllegalStateException("Idempotency service is unavailable");
+        }
+
+        var claim = idempotencyService.claim(operation, idempotencyKey, requestHash);
+        if (claim.status() == ClaimStatus.COMPLETED) {
+            return toSse(replayEvents(idempotencyService.readCompleted(claim.payload(), String.class)),
+                    explain, mode);
+        }
+        if (claim.status() == ClaimStatus.IN_PROGRESS) {
+            return toSse(replayEvents(idempotencyService.awaitCompleted(
+                    operation, idempotencyKey, requestHash, String.class)), explain, mode);
+        }
+
+        StringBuilder answer = new StringBuilder();
+        return toSse(events.get()
+                .doOnNext(event -> {
+                    if (event.isToken() && event.content() != null) {
+                        answer.append(event.content());
+                    }
+                })
+                .doOnComplete(() -> idempotencyService.complete(
+                        operation, idempotencyKey, requestHash, claim.ownerToken(), answer.toString()))
+                .doOnError(error -> idempotencyService.release(
+                        operation, idempotencyKey, requestHash, claim.ownerToken()))
+                .doOnCancel(() -> idempotencyService.release(
+                        operation, idempotencyKey, requestHash, claim.ownerToken())), explain, mode);
+    }
+
+    private Flux<ChatStreamEvent> replayEvents(String answer) {
+        return Flux.just(
+                ChatStreamEvent.token(answer),
+                ChatStreamEvent.done(answer, null));
+    }
+
+    private Flux<ServerSentEvent<String>> toSse(Flux<ChatStreamEvent> events,
+                                                boolean explain,
+                                                String mode) {
+        return events
+                .map(event -> ServerSentEvent.builder(serializeChatEvent(event, explain, mode)).build())
+                .onErrorResume(error -> {
+                    log.warn("Streaming chat failed: {}", error.getMessage());
+                    Map<String, Object> payload = new LinkedHashMap<>();
+                    payload.put("type", ChatStreamEvent.TYPE_ERROR);
+                    payload.put("message", "生成失败，请稍后重试");
+                    return Flux.just(ServerSentEvent.builder(writeJson(payload)).build());
+                });
+    }
+
+    private String serializeChatEvent(ChatStreamEvent event, boolean explain, String mode) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("type", event.type());
+        if (ChatStreamEvent.TYPE_TOKEN.equals(event.type())) {
+            payload.put("content", event.content());
+        } else if (ChatStreamEvent.TYPE_DONE.equals(event.type())) {
+            payload.put("answer", event.answer());
+            payload.put("mode", mode);
+            Object explainPayload = event.explain() != null
+                    ? event.explain()
+                    : event.result() == null ? null : buildExplainPayload(event.result());
+            if (explain && explainPayload != null) {
+                payload.put("explain", explainPayload);
+            }
+        } else if (ChatStreamEvent.TYPE_ERROR.equals(event.type())) {
+            payload.put("message", event.message());
+        }
+        return writeJson(payload);
+    }
+
+    private String writeJson(Map<String, Object> payload) {
+        try {
+            return OBJECT_MAPPER.writeValueAsString(payload);
+        } catch (JsonProcessingException exception) {
+            return "{\"type\":\"error\",\"message\":\"serialization_failed\"}";
+        }
+    }
+
+    private String normalizeChatMode(String mode) {
+        if (!StringUtils.hasText(mode)) {
+            return MODE_NORMAL;
+        }
+        String normalized = mode.trim().toLowerCase(java.util.Locale.ROOT);
+        if (MODE_NORMAL.equals(normalized) || MODE_REACT.equals(normalized) || MODE_MULTI_AGENT.equals(normalized)) {
+            return normalized;
+        }
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported chat mode: " + mode);
+    }
 
     @PostMapping("/rag/debug")
     public ResponseEntity<AdaptiveRagContext> debugAdaptiveRag(
@@ -512,6 +671,14 @@ public class AiAgentController {
                 operation,
                 idempotencyService.fingerprint(idempotencyKey),
                 requestHash);
+    }
+
+    private void requireAdmin(Authentication authentication) {
+        boolean admin = authentication.getAuthorities().stream()
+                .anyMatch(authority -> "ROLE_ADMIN".equals(authority.getAuthority()));
+        if (!admin) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Multi-agent mode requires ADMIN role");
+        }
     }
 
     private String requireUsername(Authentication authentication) {

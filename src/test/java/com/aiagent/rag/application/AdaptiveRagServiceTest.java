@@ -17,8 +17,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -29,6 +31,9 @@ class AdaptiveRagServiceTest {
 
     @Mock
     private MultiRecallService multiRecallService;
+
+    @Mock
+    private QueryPlanner queryPlanner;
 
     @Mock
     private PlatformMetricsService metricsService;
@@ -42,12 +47,16 @@ class AdaptiveRagServiceTest {
         aiProperties.getRag().setTopK(5);
         aiProperties.getRag().setSimilarityThreshold(0.7);
         when(metricsService.startSample()).thenReturn(Timer.start());
+        lenient().when(queryPlanner.plan(anyString()))
+                .thenAnswer(invocation -> QueryPlanResult.single(
+                        invocation.getArgument(0), "gate_skipped"));
 
         adaptiveRagService = new AdaptiveRagService(
                 aiProperties,
                 multiRecallService,
                 new QueryRouter(aiProperties),
                 new QueryRewriter(aiProperties),
+                queryPlanner,
                 new SelfRagVerifier(aiProperties),
                 (query, chunks) -> withSemanticScores(chunks, 0.95),
                 metricsService
@@ -93,6 +102,31 @@ class AdaptiveRagServiceTest {
         assertThat(context.getContext()).contains("RRF 和加权融合的区别在于排序机制");
         verify(multiRecallService, times(2)).search(anyString(), eq(5));
         verify(metricsService).recordAdaptiveRag(eq("MULTI_HOP"), eq("HIGH"), anyBoolean(), eq(2), eq(1), eq("verification_high"), eq(true), any());
+    }
+
+    @Test
+    void shouldUseMultiQueryRetrievalWhenPlannerReturnsVariants() {
+        String question = "今天能发货吗？具体什么时候发货？什么时候到货？";
+        when(queryPlanner.plan(question)).thenReturn(QueryPlanResult.builder()
+                .originalQuery(question)
+                .planned(true)
+                .fallback(false)
+                .reason("multiple questions")
+                .subQueries(List.of("什么时候发货", "什么时候到货"))
+                .expansions(List.of("发货时效"))
+                .retrievalQueries(List.of(question, "什么时候发货", "什么时候到货", "发货时效"))
+                .build());
+        when(multiRecallService.searchMulti(anyList(), eq(5))).thenReturn(List.of(
+                RetrievalChunk.builder().id("doc-1").content("一般 48 小时内发货，3 天到货").metadata(Map.of()).build()));
+
+        AdaptiveRagContext context = adaptiveRagService.resolve(question);
+
+        assertThat(context.getContext()).contains("48 小时");
+        verify(multiRecallService).searchMulti(anyList(), eq(5));
+        verify(multiRecallService, never()).search(anyString(), anyInt());
+        assertThat(context.getRoundTraces().get(0).getRetrievalQueries())
+                .containsExactly(question, "什么时候发货", "什么时候到货", "发货时效");
+        assertThat(context.getRoundTraces().get(0).getQueryPlanReason()).isEqualTo("multiple questions");
     }
 
     @Test

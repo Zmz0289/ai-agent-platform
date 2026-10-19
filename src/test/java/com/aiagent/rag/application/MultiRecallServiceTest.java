@@ -317,6 +317,45 @@ class MultiRecallServiceTest {
         verify(metricsService).recordRagSearch(false, 1, sample);
     }
 
+    @Test
+    void shouldFuseMultiQueryResultsWithOriginalQueryWeightedHighest() {
+        aiProperties.getRag().setEnableHybridSearch(false);
+        when(ragCacheService.getCachedResults(anyString())).thenReturn(null);
+        when(documentService.searchSimilar(eq("original question"), eq(10), eq(0.66))).thenReturn(List.of(
+                chunk("a", "alpha"),
+                chunk("b", "beta")));
+        when(documentService.searchSimilar(eq("sub question"), eq(10), eq(0.66))).thenReturn(List.of(
+                chunk("b", "beta"),
+                chunk("c", "gamma")));
+
+        List<RetrievalChunk> results = multiRecallService.searchMulti(List.of(
+                new MultiRecallService.QuerySpec("original question", "original", 1.0),
+                new MultiRecallService.QuerySpec("sub question", "sub_question", 0.85)
+        ), 3);
+
+        assertThat(results).extracting(RetrievalChunk::getId).containsExactly("b", "a", "c");
+        assertThat(results.get(0).getMetadata()).containsEntry("queryHitCount", 2);
+        List<?> matchedQueries = (List<?>) results.get(0).getMetadata().get("matchedQueries");
+        assertThat(matchedQueries.stream().map(String::valueOf).toList())
+                .containsExactly("original question", "sub question");
+        verify(ragCacheService).cacheResults(anyString(), eq(results));
+    }
+
+    @Test
+    void shouldFallBackToSingleQueryWhenMultiQueryHasOneSpec() {
+        aiProperties.getRag().setEnableHybridSearch(false);
+        when(ragCacheService.getCachedResults(anyString())).thenReturn(null);
+        when(documentService.searchSimilar(eq("single question"), eq(2), eq(0.66)))
+                .thenReturn(List.of(chunk("a", "alpha")));
+
+        List<RetrievalChunk> results = multiRecallService.searchMulti(List.of(
+                new MultiRecallService.QuerySpec("single question", "original", 1.0)
+        ), 2);
+
+        assertThat(results).extracting(RetrievalChunk::getId).containsExactly("a");
+        verify(documentService).searchSimilar("single question", 2, 0.66);
+    }
+
     private static RetrievalChunk chunk(String id, String content) {
         return RetrievalChunk.builder()
                 .id(id)

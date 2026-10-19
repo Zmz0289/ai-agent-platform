@@ -84,6 +84,8 @@ public class SecurityConfig {
                 }
 
                 auth
+                    .requestMatchers(HttpMethod.POST, "/api/v1/agent/chat/stream")
+                            .hasAnyRole("USER", "ADMIN")
                     .requestMatchers(HttpMethod.POST,
                             "/api/v1/agent/session",
                             "/api/v1/agent/chat",
