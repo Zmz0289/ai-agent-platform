@@ -2,6 +2,7 @@ package com.aiagent.rag.application;
 
 import com.aiagent.ecommerce.infrastructure.repository.EcommerceQaPairRepository;
 import com.aiagent.infrastructure.config.AiProperties;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import com.aiagent.knowledge.domain.RetrievalChunk;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -23,6 +24,13 @@ public class EcommerceQaLexicalSearchService {
     private final AiProperties aiProperties;
 
     public List<RetrievalChunk> search(String query, int topK) {
+        return search(query, topK, TenantContext.currentTenant());
+    }
+
+    /**
+     * 指定租户的全文召回；异步线程中必须显式传入调用方捕获的租户。
+     */
+    public List<RetrievalChunk> search(String query, int topK, String tenantId) {
         if (!isEnabled() || !StringUtils.hasText(query) || topK <= 0) {
             return List.of();
         }
@@ -32,8 +40,9 @@ public class EcommerceQaLexicalSearchService {
             normalizedQuery = normalizedQuery.substring(0, MAX_QUERY_CHARACTERS);
         }
 
+        String tenant = TenantContext.resolve(tenantId, TenantContext.DEFAULT_TENANT);
         try {
-            return repository.searchQuestionFullText(normalizedQuery, topK).stream()
+            return repository.searchQuestionFullText(tenant, normalizedQuery, topK).stream()
                     .map(this::toChunk)
                     .toList();
         } catch (RuntimeException exception) {

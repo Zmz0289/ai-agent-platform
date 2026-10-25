@@ -3,6 +3,7 @@ package com.aiagent.rag.application;
 import com.aiagent.infrastructure.cache.RagCacheService;
 import com.aiagent.infrastructure.config.AiProperties;
 import com.aiagent.infrastructure.metrics.PlatformMetricsService;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import com.aiagent.knowledge.application.DocumentService;
 import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.aiagent.knowledge.infrastructure.vectorstore.VectorStoreService;
@@ -18,12 +19,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -44,7 +40,8 @@ public class MultiRecallService {
     private final CrossEncoderRerankClient crossEncoderRerankClient;
     private final Executor ioTaskExecutor;
     private final Object indexLock = new Object();
-    private volatile Bm25IndexHolder corpusBm25;
+    /** 语料 BM25 索引按租户隔离，避免复用其他租户的候选池。 */
+    private final Map<String, Bm25IndexHolder> corpusBm25ByTenant = new HashMap<>();
 
     public MultiRecallService(DocumentService documentService,
                               AiProperties aiProperties,
@@ -85,6 +82,7 @@ public class MultiRecallService {
 
     public List<RetrievalChunk> search(String query, SearchOptions requestedOptions) {
         SearchOptions options = resolveOptions(requestedOptions);
+        String tenantId = TenantContext.currentTenant();
         Timer.Sample sample = metricsService.startSample();
         boolean cacheHit = false;
         int resultCount = 0;
@@ -102,7 +100,7 @@ public class MultiRecallService {
                 }
             }
 
-            List<RetrievalChunk> finalResults = retrieveSingle(query, options);
+            List<RetrievalChunk> finalResults = retrieveSingle(query, options, tenantId);
             resultCount = finalResults.size();
             if (options.isCacheEnabled()) {
                 ragCacheService.cacheResults(cacheKeyMaterial, finalResults);
@@ -138,6 +136,7 @@ public class MultiRecallService {
         if (specs.size() == 1) {
             return search(specs.get(0).query(), options);
         }
+        String tenantId = TenantContext.currentTenant();
 
         Timer.Sample sample = metricsService.startSample();
         boolean cacheHit = false;
@@ -161,7 +160,7 @@ public class MultiRecallService {
                     .hybridSearch(options.isHybridSearch())
                     .cacheEnabled(false)
                     .build();
-            List<List<RetrievalChunk>> perQueryResults = retrieveInParallel(specs, perQueryOptions);
+            List<List<RetrievalChunk>> perQueryResults = retrieveInParallel(specs, perQueryOptions, tenantId);
             List<RetrievalChunk> fused = fuseQueryResults(specs, perQueryResults,
                     positiveOrDefault(aiProperties.getRag().getHybridRrfK(), 60));
             List<RetrievalChunk> finalResults = rerankFusedQueries(
@@ -180,7 +179,7 @@ public class MultiRecallService {
     /**
      * 单 query 召回：FAQ 优先级联 -> 混合/向量检索。不读写缓存、不记录指标。
      */
-    private List<RetrievalChunk> retrieveSingle(String query, SearchOptions options) {
+    private List<RetrievalChunk> retrieveSingle(String query, SearchOptions options, String tenantId) {
         // === FAQ 优先级联检索（级联第一层）===
         // FAQ 标准问题命中直接返回（无需混合检索/raw 回退）；未命中继续走 raw 库检索。
         AiProperties.Milvus milvusConfig = aiProperties.getVectorStore().getMilvus();
@@ -205,7 +204,7 @@ public class MultiRecallService {
             int bm25CandidateTopK = positiveOrDefault(ragConfig.getHybridBm25CandidateTopK(), 20);
             int mysqlCandidateTopK = positiveOrDefault(ragConfig.getHybridMysqlCandidateTopK(), 50);
             CompletableFuture<List<RetrievalChunk>> lexicalFuture = startLexicalSearch(
-                    query, mysqlCandidateTopK, ragConfig.isHybridMysqlFulltextEnabled());
+                    query, mysqlCandidateTopK, ragConfig.isHybridMysqlFulltextEnabled(), tenantId);
             int fallbackVectorTopK = Math.max(50, Math.max(vectorCandidateTopK, bm25CandidateTopK));
             int vectorSearchTopK = ragConfig.isHybridMysqlFulltextEnabled()
                     ? options.getTopK()
@@ -216,14 +215,15 @@ public class MultiRecallService {
                 Map<Integer, List<RetrievalChunk>> vectorBatches = vectorSearch(
                         query,
                         List.of(vectorSearchTopK, vectorCandidateTopK),
-                        options.getSimilarityThreshold());
+                        options.getSimilarityThreshold(),
+                        tenantId);
                 stableVectorResults = vectorBatches.getOrDefault(vectorSearchTopK, List.of());
                 vectorResults = mergeCandidates(
                         stableVectorResults,
                         vectorBatches.getOrDefault(vectorCandidateTopK, List.of()));
             } else {
                 stableVectorResults = vectorSearch(
-                        query, vectorSearchTopK, options.getSimilarityThreshold());
+                        query, vectorSearchTopK, options.getSimilarityThreshold(), tenantId);
                 vectorResults = stableVectorResults;
             }
             log.debug("Vector result size={}, stable vector size={}",
@@ -235,13 +235,14 @@ public class MultiRecallService {
                         query,
                         bm25CandidateTopK,
                         ragConfig.isBm25StopwordEnabled(),
-                        positiveOrDefault(ragConfig.getHybridBm25CorpusMaxDocs(), 5000));
+                        positiveOrDefault(ragConfig.getHybridBm25CorpusMaxDocs(), 5000),
+                        tenantId);
             }
             if (lexicalResults.isEmpty()) {
                 log.debug("Corpus BM25 disabled or unavailable, using candidate-pool BM25");
                 if (vectorSearchTopK < fallbackVectorTopK) {
                     vectorResults = vectorSearch(
-                            query, fallbackVectorTopK, options.getSimilarityThreshold());
+                            query, fallbackVectorTopK, options.getSimilarityThreshold(), tenantId);
                 }
                 lexicalResults = bm25SearchOnCandidates(
                         query, vectorResults, bm25CandidateTopK,
@@ -271,7 +272,7 @@ public class MultiRecallService {
             log.debug("RRF fused result size={}", finalResults.size());
         } else {
             finalResults = annotateVectorOnly(
-                    vectorSearch(query, options.getTopK(), options.getSimilarityThreshold()),
+                    vectorSearch(query, options.getTopK(), options.getSimilarityThreshold(), tenantId),
                     options.getTopK());
             log.debug("Vector-only result size={}", finalResults.size());
         }
@@ -363,18 +364,19 @@ public class MultiRecallService {
     }
 
     private List<List<RetrievalChunk>> retrieveInParallel(List<QuerySpec> specs,
-                                                          SearchOptions perQueryOptions) {
+                                                          SearchOptions perQueryOptions,
+                                                          String tenantId) {
         List<CompletableFuture<List<RetrievalChunk>>> futures = new ArrayList<>(specs.size());
         for (QuerySpec spec : specs) {
             try {
                 futures.add(CompletableFuture.supplyAsync(
-                        () -> retrieveSingle(spec.query(), perQueryOptions), ioTaskExecutor));
+                        () -> retrieveSingle(spec.query(), perQueryOptions, tenantId), ioTaskExecutor));
             } catch (RuntimeException schedulingFailure) {
                 log.warn("Unable to schedule multi-query retrieval, running inline: {}",
                         schedulingFailure.getMessage());
                 try {
                     futures.add(CompletableFuture.completedFuture(
-                            retrieveSingle(spec.query(), perQueryOptions)));
+                            retrieveSingle(spec.query(), perQueryOptions, tenantId)));
                 } catch (RuntimeException executionFailure) {
                     futures.add(CompletableFuture.failedFuture(executionFailure));
                 }
@@ -611,12 +613,14 @@ public class MultiRecallService {
 
     private CompletableFuture<List<RetrievalChunk>> startLexicalSearch(String query,
                                                                         int topK,
-                                                                        boolean enabled) {
+                                                                        boolean enabled,
+                                                                        String tenantId) {
         if (!enabled) {
             return CompletableFuture.completedFuture(List.of());
         }
         try {
-            return CompletableFuture.supplyAsync(() -> lexicalSearchService.search(query, topK), ioTaskExecutor);
+            return CompletableFuture.supplyAsync(
+                    () -> lexicalSearchService.search(query, topK, tenantId), ioTaskExecutor);
         } catch (RuntimeException exception) {
             log.warn("Unable to schedule lexical retrieval: {}", exception.getMessage());
             return CompletableFuture.completedFuture(List.of());
@@ -633,9 +637,11 @@ public class MultiRecallService {
         }
     }
 
-    private List<RetrievalChunk> vectorSearch(String query, int topK, double threshold) {
+    private List<RetrievalChunk> vectorSearch(String query, int topK, double threshold, String tenantId) {
         try {
-            return documentService.searchSimilar(query, topK, threshold);
+            return TenantContext.DEFAULT_TENANT.equals(tenantId)
+                    ? documentService.searchSimilar(query, topK, threshold)
+                    : documentService.searchSimilar(query, topK, threshold, tenantId);
         } catch (KnowledgeRetrievalUnavailableException exception) {
             throw exception;
         } catch (Exception e) {
@@ -647,9 +653,12 @@ public class MultiRecallService {
 
     private Map<Integer, List<RetrievalChunk>> vectorSearch(String query,
                                                             List<Integer> topKs,
-                                                            double threshold) {
+                                                            double threshold,
+                                                            String tenantId) {
         try {
-            return documentService.searchSimilar(query, topKs, threshold);
+            return TenantContext.DEFAULT_TENANT.equals(tenantId)
+                    ? documentService.searchSimilar(query, topKs, threshold)
+                    : documentService.searchSimilar(query, topKs, threshold, tenantId);
         } catch (Exception exception) {
             log.error("Vector search failed", exception);
             throw new KnowledgeRetrievalUnavailableException(
@@ -677,8 +686,9 @@ public class MultiRecallService {
     private List<RetrievalChunk> bm25SearchCorpus(String query,
                                                    int topK,
                                                    boolean stopwordEnabled,
-                                                   int maxDocs) {
-        Bm25Search index = corpusBm25Index(stopwordEnabled, maxDocs);
+                                                   int maxDocs,
+                                                   String tenantId) {
+        Bm25Search index = corpusBm25Index(stopwordEnabled, maxDocs, tenantId);
         if (index == null) {
             return List.of();
         }
@@ -690,38 +700,41 @@ public class MultiRecallService {
         }
     }
 
-    private Bm25Search corpusBm25Index(boolean stopwordEnabled, int maxDocs) {
-        Bm25IndexHolder holder = corpusBm25;
+    private Bm25Search corpusBm25Index(boolean stopwordEnabled, int maxDocs, String tenantId) {
+        Bm25IndexHolder holder = corpusBm25ByTenant.get(tenantId);
         if (holder != null && !holder.isStale(stopwordEnabled, maxDocs)) {
             return holder.index;
         }
         synchronized (indexLock) {
-            holder = corpusBm25;
+            holder = corpusBm25ByTenant.get(tenantId);
             if (holder != null && !holder.isStale(stopwordEnabled, maxDocs)) {
                 return holder.index;
             }
             List<RetrievalChunk> corpus;
             try {
-                corpus = vectorStoreService.fetchAllChunks(maxDocs);
+                corpus = TenantContext.DEFAULT_TENANT.equals(tenantId)
+                        ? vectorStoreService.fetchAllChunks(maxDocs)
+                        : vectorStoreService.fetchAllChunks(maxDocs, tenantId);
             } catch (Exception e) {
-                log.warn("Failed to load corpus for BM25 index: {}", e.getMessage());
-                corpusBm25 = Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs);
+                log.warn("Failed to load corpus for BM25 index (tenant={}): {}", tenantId, e.getMessage());
+                corpusBm25ByTenant.put(tenantId, Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs));
                 return null;
             }
             if (corpus == null || corpus.isEmpty()) {
-                log.warn("Corpus is empty; corpus BM25 unavailable");
-                corpusBm25 = Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs);
+                log.warn("Corpus is empty for tenant [{}]; corpus BM25 unavailable", tenantId);
+                corpusBm25ByTenant.put(tenantId, Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs));
                 return null;
             }
             if (corpus.size() >= maxDocs) {
                 log.warn("BM25 corpus reached configured limit {}; refusing to treat a truncated corpus as complete",
                         maxDocs);
-                corpusBm25 = Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs);
+                corpusBm25ByTenant.put(tenantId, Bm25IndexHolder.unavailable(stopwordEnabled, maxDocs));
                 return null;
             }
             Bm25Search built = new Bm25Search(corpus, stopwordEnabled);
-            corpusBm25 = new Bm25IndexHolder(built, System.currentTimeMillis(), stopwordEnabled, maxDocs);
-            log.info("Rebuilt corpus BM25 index over {} chunks", corpus.size());
+            corpusBm25ByTenant.put(tenantId,
+                    new Bm25IndexHolder(built, System.currentTimeMillis(), stopwordEnabled, maxDocs));
+            log.info("Rebuilt corpus BM25 index over {} chunks (tenant={})", corpus.size(), tenantId);
             return built;
         }
     }

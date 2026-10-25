@@ -1,10 +1,14 @@
 package com.aiagent.ecommerce.api;
 
 import com.aiagent.ecommerce.application.EcommerceKnowledgeImportService;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
 import java.util.concurrent.Executor;
@@ -25,19 +29,22 @@ public class EcommerceImportController {
             return ResponseEntity.badRequest().body(Map.of("error", "filePath cannot be empty"));
         }
 
-        log.info("Received import request: {}", filePath);
+        // 异步任务不继承 ThreadLocal，必须在提交前捕获租户并显式传递
+        String tenantId = TenantContext.currentTenant();
+        log.info("Received import request: {} (tenant={})", filePath, tenantId);
 
-        taskExecutor.execute(() -> {
+        taskExecutor.execute(TenantContext.wrap(() -> {
             try {
-                importService.importFromFile(filePath);
+                importService.importFromFile(filePath, tenantId);
             } catch (Exception e) {
-                log.error("Import failed: {}", filePath, e);
+                log.error("Import failed: {} (tenant={})", filePath, tenantId, e);
             }
-        });
+        }));
 
         return ResponseEntity.ok(Map.of(
                 "status", "started",
                 "filePath", filePath,
+                "tenantId", tenantId,
                 "message", "Import task started, check logs for progress"
         ));
     }

@@ -11,10 +11,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class EcommerceQaLexicalSearchServiceTest {
@@ -42,7 +39,7 @@ class EcommerceQaLexicalSearchServiceTest {
         when(candidate.getQaText()).thenReturn("用户问题：怎么退款 客服回答：先申请售后");
         when(candidate.getCategory()).thenReturn("refund");
         when(candidate.getLexicalScore()).thenReturn(3.5);
-        when(repository.searchQuestionFullText("怎么退款", 5)).thenReturn(List.of(candidate));
+        when(repository.searchQuestionFullText("default", "怎么退款", 5)).thenReturn(List.of(candidate));
 
         var results = service.search("怎么退款", 5);
 
@@ -59,12 +56,12 @@ class EcommerceQaLexicalSearchServiceTest {
         aiProperties.getVectorStore().setMode("langchain");
 
         assertThat(service.search("refund", 5)).isEmpty();
-        verify(repository, never()).searchQuestionFullText("refund", 5);
+        verify(repository, never()).searchQuestionFullText("default", "refund", 5);
     }
 
     @Test
     void shouldDegradeWhenFullTextQueryFails() {
-        when(repository.searchQuestionFullText("refund", 5)).thenThrow(new IllegalStateException("index missing"));
+        when(repository.searchQuestionFullText("default", "refund", 5)).thenThrow(new IllegalStateException("index missing"));
 
         assertThat(service.search("refund", 5)).isEmpty();
     }

@@ -1,14 +1,14 @@
 package com.aiagent.knowledge.application;
 
-import com.aiagent.knowledge.domain.Document;
-import com.aiagent.knowledge.domain.DocumentProcessingStatus;
-import com.aiagent.knowledge.domain.DocumentChunk;
-import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.aiagent.infrastructure.config.AiProperties;
 import com.aiagent.infrastructure.metrics.PlatformMetricsService;
-import com.aiagent.knowledge.infrastructure.repository.DocumentRepository;
-import com.aiagent.knowledge.infrastructure.repository.DocumentChunkRepository;
+import com.aiagent.knowledge.domain.Document;
+import com.aiagent.knowledge.domain.DocumentChunk;
+import com.aiagent.knowledge.domain.DocumentProcessingStatus;
+import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.aiagent.knowledge.infrastructure.parser.DocumentParserFactory;
+import com.aiagent.knowledge.infrastructure.repository.DocumentChunkRepository;
+import com.aiagent.knowledge.infrastructure.repository.DocumentRepository;
 import com.aiagent.knowledge.infrastructure.storage.DocumentStagingStorage;
 import com.aiagent.knowledge.infrastructure.vectorstore.VectorStoreService;
 import com.aiagent.shared.exception.ResourceStateConflictException;
@@ -37,11 +37,8 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.lenient;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class DocumentServiceTest {
@@ -141,7 +138,7 @@ class DocumentServiceTest {
     @Test
     void shouldDeleteNewStagingFileWhenContentAlreadyExists() throws Exception {
         Document existing = Document.builder().id(9L).fileName("existing.md").build();
-        when(documentRepository.findByContentHash(any())).thenReturn(Optional.of(existing));
+        when(documentRepository.findByTenantIdAndContentHash(eq("default"), any())).thenReturn(Optional.of(existing));
 
         Document result = documentService.uploadDocument(
                 new MockMultipartFile("file", "duplicate.md", "text/markdown", "same".getBytes()));
@@ -193,7 +190,7 @@ class DocumentServiceTest {
                 .chunkCount(3)
                 .processingStatus(DocumentProcessingStatus.COMPLETED)
                 .build();
-        when(documentRepository.findById(7L)).thenReturn(Optional.of(document));
+        when(documentRepository.findByIdAndTenantId(7L, "default")).thenReturn(Optional.of(document));
 
         var status = documentService.getDocumentStatus(7L);
 
@@ -227,7 +224,7 @@ class DocumentServiceTest {
                 .processingStatus(DocumentProcessingStatus.FAILED)
                 .errorMessage("Milvus unavailable")
                 .build();
-        when(documentRepository.findByIdForUpdate(31L)).thenReturn(Optional.of(document));
+        when(documentRepository.findByIdForUpdateAndTenantId(31L, "default")).thenReturn(Optional.of(document));
         when(documentRepository.save(document)).thenReturn(document);
 
         Document retried = documentService.retryDocument(31L);
@@ -244,7 +241,7 @@ class DocumentServiceTest {
                 .id(32L)
                 .processingStatus(DocumentProcessingStatus.COMPLETED)
                 .build();
-        when(documentRepository.findByIdForUpdate(32L)).thenReturn(Optional.of(document));
+        when(documentRepository.findByIdForUpdateAndTenantId(32L, "default")).thenReturn(Optional.of(document));
 
         assertThatThrownBy(() -> documentService.retryDocument(32L))
                 .isInstanceOf(ResourceStateConflictException.class)
@@ -257,7 +254,7 @@ class DocumentServiceTest {
                 .id(40L)
                 .processingStatus(DocumentProcessingStatus.COMPLETED)
                 .build();
-        when(documentRepository.findByIdForUpdate(40L)).thenReturn(Optional.of(document));
+        when(documentRepository.findByIdForUpdateAndTenantId(40L, "default")).thenReturn(Optional.of(document));
         when(documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(40L)).thenReturn(List.of(
                 DocumentChunk.builder().documentId(40L).chunkIndex(0).vectorId("v1").build(),
                 DocumentChunk.builder().documentId(40L).chunkIndex(1).vectorId("v2").build()));
@@ -275,7 +272,7 @@ class DocumentServiceTest {
                 .id(41L)
                 .processingStatus(DocumentProcessingStatus.PROCESSING)
                 .build();
-        when(documentRepository.findByIdForUpdate(41L)).thenReturn(Optional.of(document));
+        when(documentRepository.findByIdForUpdateAndTenantId(41L, "default")).thenReturn(Optional.of(document));
 
         assertThatThrownBy(() -> documentService.deleteDocument(41L))
                 .isInstanceOf(ResourceStateConflictException.class)

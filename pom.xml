@@ -150,6 +150,11 @@
                     <groupId>org.bouncycastle</groupId>
                     <artifactId>bcprov-jdk15on</artifactId>
                 </exclusion>
+                <!-- unirest → httpclient 传递 commons-logging，同样与 spring-jcl 冲突，统一交给 spring-jcl -->
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
             </exclusions>
         </dependency>
 
@@ -163,6 +168,16 @@
             <groupId>org.apache.pdfbox</groupId>
             <artifactId>pdfbox</artifactId>
             <version>${pdfbox.version}</version>
+            <exclusions>
+                <!-- pdfbox 2.x 硬依赖 commons-logging，会与 Spring 的 spring-jcl 抢同一套
+                     org.apache.commons.logging 实现，启动即打印 "Standard Commons Logging discovery
+                     in action with spring-jcl" 且 PDFBox 日志绕过 logback 直接写 stderr。
+                     由 spring-jcl 统一提供该 API 并桥接到 slf4j 即可。 -->
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
@@ -288,7 +303,12 @@
             <dependency>
                 <groupId>org.apache.opennlp</groupId>
                 <artifactId>opennlp-tools</artifactId>
-                <version>2.5.9</version>
+                <!-- 必须与 langchain4j 0.34.0 的编译目标保持一致（其 parent pom 也声明 1.9.4）：
+                     langchain4j 的 DocumentBySentenceSplitter / HierarchicalDocumentSplitter#getOverlapSentenceSplitter
+                     链接的是 opennlp 1.9.x 的 SentenceDetectorME.sentDetect(String)，
+                     而 2.x 已把入参改为 CharSequence，升级会导致文档切分运行期抛
+                     NoSuchMethodError: 'java.lang.String[] ...sentDetect(java.lang.String)' -->
+                <version>1.9.4</version>
             </dependency>
             <dependency>
                 <groupId>org.apache.commons</groupId>

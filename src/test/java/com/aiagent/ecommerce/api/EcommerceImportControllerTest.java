@@ -7,9 +7,12 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.ResponseEntity;
+
 import java.util.Map;
 import java.util.concurrent.Executor;
-import static org.junit.jupiter.api.Assertions.*;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.verify;
 
 @ExtendWith(MockitoExtension.class)
 class EcommerceImportControllerTest {
@@ -27,10 +30,12 @@ class EcommerceImportControllerTest {
         ResponseEntity<Map<String, Object>> resp = controller.importKnowledge(Map.of());
         assertEquals(400, resp.getStatusCode().value());
     }
-    @Test void shouldStartImport() {
+    @Test void shouldStartImport() throws Exception {
         ResponseEntity<Map<String, Object>> resp = controller.importKnowledge(Map.of("filePath", "/tmp/test.jsonl"));
         assertEquals(200, resp.getStatusCode().value());
         assertEquals("started", resp.getBody().get("status"));
+        assertEquals("default", resp.getBody().get("tenantId"));
+        verify(importService).importFromFile("/tmp/test.jsonl", "default");
     }
     @Test void shouldRejectTestImportEmptyPath() {
         ResponseEntity<Map<String, Object>> resp = controller.testImport(Map.of("filePath", ""));

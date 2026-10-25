@@ -19,17 +19,8 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyList;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.clearInvocations;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class MultiRecallServiceTest {
@@ -222,7 +213,7 @@ class MultiRecallServiceTest {
         String cacheKey = "exact keyword|topK=3|threshold=0.6600|hybrid=true"
                 + "|vw=0.5000|bw=0.5000|rrfK=60|stopwords=true|vTopK=20|bTopK=20|bMaxDocs=5000|corpusBm25=false|mysqlFt=true|mysqlTopK=50|preserveV=1";
         when(ragCacheService.getCachedResults(cacheKey)).thenReturn(null);
-        when(lexicalSearchService.search("exact keyword", 50)).thenReturn(lexicalResults);
+        when(lexicalSearchService.search("exact keyword", 50, "default")).thenReturn(lexicalResults);
         when(documentService.searchSimilar("exact keyword", 3, 0.66)).thenReturn(vectorResults);
 
         List<RetrievalChunk> results = multiRecallService.search("exact keyword", 3);
@@ -260,7 +251,7 @@ class MultiRecallServiceTest {
         when(documentService.searchSimilar("refund", List.of(3, 20), 0.66)).thenReturn(Map.of(
                 3, vectorResults,
                 20, expandedVectorResults));
-        when(lexicalSearchService.search("refund", 50)).thenReturn(lexicalResults);
+        when(lexicalSearchService.search("refund", 50, "default")).thenReturn(lexicalResults);
         when(crossEncoderRerankClient.rerank(eq("refund"), anyList())).thenReturn(List.of(
                 new CrossEncoderRerankClient.RerankScore(0, 0.40),
                 new CrossEncoderRerankClient.RerankScore(1, 0.50),
@@ -290,7 +281,7 @@ class MultiRecallServiceTest {
         when(documentService.searchSimilar("refund", List.of(2, 20), 0.66)).thenReturn(Map.of(
                 2, List.of(chunk("vector", "vector")),
                 20, List.of(chunk("vector", "vector"))));
-        when(lexicalSearchService.search("refund", 50)).thenReturn(List.of(chunk("lexical", "lexical")));
+        when(lexicalSearchService.search("refund", 50, "default")).thenReturn(List.of(chunk("lexical", "lexical")));
         when(crossEncoderRerankClient.rerank(eq("refund"), anyList()))
                 .thenThrow(new IllegalStateException("reranker down"));
 

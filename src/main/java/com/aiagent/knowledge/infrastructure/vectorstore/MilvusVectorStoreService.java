@@ -1,6 +1,7 @@
 package com.aiagent.knowledge.infrastructure.vectorstore;
 
 import com.aiagent.infrastructure.config.AiProperties;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import com.aiagent.knowledge.domain.RetrievalChunk;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
@@ -17,13 +18,16 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.*;
 
+/**
+ * LangChain4j Milvus 适配器。
+ *
+ * <p>多租户采用 collection 级物理隔离：default 租户沿用基础 collection（兼容存量数据），
+ * 其他租户按需创建 {@code <base>_<tenantId>} collection。</p>
+ */
 @Slf4j
 @Service
 @Primary
@@ -34,6 +38,8 @@ public class MilvusVectorStoreService implements VectorStoreService {
     private final AiProperties aiProperties;
     private final MilvusClientV2 milvusClient;
     private final InMemoryVectorStoreService fallbackStore = new InMemoryVectorStoreService();
+    private final Map<String, MilvusEmbeddingStore> tenantStores = new ConcurrentHashMap<>();
+    private final Object tenantStoreLock = new Object();
     private MilvusEmbeddingStore embeddingStore;
 
     public MilvusVectorStoreService(AiProperties aiProperties, Optional<MilvusClientV2> milvusClient) {
@@ -82,44 +88,72 @@ public class MilvusVectorStoreService implements VectorStoreService {
 
     @Override
     public void add(String id, Embedding embedding) {
+        add(id, embedding, TenantContext.currentTenant());
+    }
+
+    @Override
+    public void add(String id, Embedding embedding, String tenantId) {
         ensureWritable();
-        if (embeddingStore != null) {
-            embeddingStore.add(id, embedding);
+        MilvusEmbeddingStore store = storeFor(tenantId);
+        if (store != null) {
+            store.add(id, embedding);
             return;
         }
         requireFallbackEnabled();
-        fallbackStore.add(id, embedding);
+        fallbackStore.add(id, embedding, tenantId);
     }
 
     @Override
     public List<String> addAll(List<Embedding> embeddings, List<TextSegment> segments) {
+        return addAll(embeddings, segments, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<String> addAll(List<Embedding> embeddings, List<TextSegment> segments, String tenantId) {
         ensureWritable();
-        if (embeddingStore != null) {
-            return embeddingStore.addAll(embeddings, segments);
+        MilvusEmbeddingStore store = storeFor(tenantId);
+        if (store != null) {
+            return store.addAll(embeddings, segments);
         }
         requireFallbackEnabled();
-        return fallbackStore.addAll(embeddings, segments);
+        return fallbackStore.addAll(embeddings, segments, tenantId);
     }
 
     @Override
     public List<EmbeddingMatch<TextSegment>> search(Embedding queryEmbedding, int topK, double minScore) {
-        if (embeddingStore != null) {
+        return search(queryEmbedding, topK, minScore, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<EmbeddingMatch<TextSegment>> search(Embedding queryEmbedding,
+                                                    int topK,
+                                                    double minScore,
+                                                    String tenantId) {
+        MilvusEmbeddingStore store = storeFor(tenantId);
+        if (store != null) {
             EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
                     .queryEmbedding(queryEmbedding)
                     .maxResults(topK)
                     .minScore(minScore)
                     .build();
-            return embeddingStore.search(request).matches();
+            return store.search(request).matches();
         }
         return fallbackEnabled() && !readOnly()
-                ? fallbackStore.search(queryEmbedding, topK, minScore)
+                ? fallbackStore.search(queryEmbedding, topK, minScore, tenantId)
                 : List.of();
     }
 
     @Override
     public List<RetrievalChunk> fetchAllChunks(int maxDocs) {
+        return fetchAllChunks(maxDocs, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<RetrievalChunk> fetchAllChunks(int maxDocs, String tenantId) {
         if (embeddingStore == null) {
-            return fallbackEnabled() && !readOnly() ? fallbackStore.fetchAllChunks(maxDocs) : List.of();
+            return fallbackEnabled() && !readOnly()
+                    ? fallbackStore.fetchAllChunks(maxDocs, tenantId)
+                    : List.of();
         }
         log.warn("Full-corpus fetch is not supported for the LangChain4j Milvus store; hybrid falls back to candidate-pool BM25");
         return List.of();
@@ -127,29 +161,94 @@ public class MilvusVectorStoreService implements VectorStoreService {
 
     @Override
     public void remove(String id) {
+        remove(id, TenantContext.currentTenant());
+    }
+
+    @Override
+    public void remove(String id, String tenantId) {
         ensureWritable();
-        if (embeddingStore != null) {
-            embeddingStore.remove(id);
+        MilvusEmbeddingStore store = storeFor(tenantId);
+        if (store != null) {
+            store.remove(id);
             return;
         }
         requireFallbackEnabled();
-        fallbackStore.remove(id);
+        fallbackStore.remove(id, tenantId);
     }
 
     @Override
     public void removeAll() {
+        removeAll(TenantContext.currentTenant());
+    }
+
+    @Override
+    public void removeAll(String tenantId) {
         ensureWritable();
-        if (embeddingStore != null) {
-            embeddingStore.removeAll();
+        MilvusEmbeddingStore store = storeFor(tenantId);
+        if (store != null) {
+            store.removeAll();
             return;
         }
         requireFallbackEnabled();
-        fallbackStore.removeAll();
+        fallbackStore.removeAll(tenantId);
     }
 
     @PreDestroy
     public void destroy() {
         log.info("Closing vector store...");
+    }
+
+    /**
+     * 解析租户对应的 collection；default 租户与关闭隔离时使用基础 collection。
+     */
+    String collectionNameFor(String tenantId) {
+        String base = aiProperties.getVectorStore().getMilvus().getCollectionName();
+        if (!tenantIsolationEnabled() || tenantId == null || TenantContext.DEFAULT_TENANT.equals(tenantId)) {
+            return base;
+        }
+        return base + "_" + tenantId;
+    }
+
+    private MilvusEmbeddingStore storeFor(String tenantId) {
+        if (embeddingStore == null) {
+            return null;
+        }
+        String collection = collectionNameFor(tenantId);
+        if (collection.equals(aiProperties.getVectorStore().getMilvus().getCollectionName())) {
+            return embeddingStore;
+        }
+        MilvusEmbeddingStore existing = tenantStores.get(collection);
+        if (existing != null) {
+            return existing;
+        }
+        synchronized (tenantStoreLock) {
+            existing = tenantStores.get(collection);
+            if (existing != null) {
+                return existing;
+            }
+            AiProperties.Milvus config = aiProperties.getVectorStore().getMilvus();
+            try {
+                MilvusEmbeddingStore created = MilvusEmbeddingStore.builder()
+                        .host(config.getHost())
+                        .port(config.getPort())
+                        .collectionName(collection)
+                        .dimension(config.getDimension())
+                        .databaseName(config.getDatabaseName())
+                        .build();
+                tenantStores.put(collection, created);
+                log.info("Initialized tenant vector collection [{}]", collection);
+                return created;
+            } catch (RuntimeException exception) {
+                log.warn("Unable to initialize tenant vector collection [{}]: {}",
+                        collection, extractMessage(exception));
+                return null;
+            }
+        }
+    }
+
+    private boolean tenantIsolationEnabled() {
+        AiProperties.Tenant tenant = aiProperties.getTenant();
+        return tenant == null || tenant.isEnabled();
     }
 
     private String extractMessage(Exception exception) {

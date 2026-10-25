@@ -1,5 +1,5 @@
 server:
-  port: 8081
+  port: 9081
   jetty:
     threads:
       max: 200
@@ -138,6 +138,12 @@ ai:
     ingestion-queue-capacity: ${AI_DOCUMENT_INGESTION_QUEUE_CAPACITY:100}
     max-upload-bytes: ${AI_DOCUMENT_MAX_UPLOAD_BYTES:20971520}
 
+  # 多租户隔离：请求头 X-Tenant-Id -> 租户；缺省落到 default-tenants 与存量数据兼容
+  tenant:
+    enabled: ${AI_TENANT_ENABLED:true}
+    header-name: ${AI_TENANT_HEADER_NAME:X-Tenant-Id}
+    default-tenant: ${AI_TENANT_DEFAULT_TENANT:default}
+
   rag:
     top-k: 5
     similarity-threshold: 0.7
@@ -165,6 +171,7 @@ ai:
       max-queries: ${AI_RAG_QUERY_PLAN_MAX_QUERIES:5}
       max-expansions: ${AI_RAG_QUERY_PLAN_MAX_EXPANSIONS:2}
       max-sub-queries: ${AI_RAG_QUERY_PLAN_MAX_SUB_QUERIES:3}
+      gate-enabled: ${AI_RAG_QUERY_PLAN_GATE_ENABLED:true}
       gate-min-length: ${AI_RAG_QUERY_PLAN_GATE_MIN_LENGTH:30}
       gate-min-question-marks: ${AI_RAG_QUERY_PLAN_GATE_MIN_QUESTION_MARKS:2}
       gate-min-hint-length: ${AI_RAG_QUERY_PLAN_GATE_MIN_HINT_LENGTH:12}

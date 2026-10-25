@@ -4,6 +4,8 @@ import com.aiagent.ecommerce.config.EcommerceProperties;
 import com.aiagent.ecommerce.domain.EcommerceQaPair;
 import com.aiagent.ecommerce.infrastructure.repository.EcommerceQaPairRepository;
 import com.aiagent.infrastructure.config.AiProperties;
+import com.aiagent.infrastructure.tenant.TenantContext;
+import com.aiagent.knowledge.infrastructure.vectorstore.MilvusAdminService;
 import com.aiagent.shared.data.DataCleaner;
 import com.aiagent.shared.data.TrainingQaParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -32,12 +34,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.HexFormat;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -56,6 +53,7 @@ import java.util.stream.Collectors;
 public class EcommerceKnowledgeImportService {
 
     private final MilvusClientV2 milvusClient;
+    private final MilvusAdminService milvusAdminService;
     private final ObjectMapper objectMapper;
     private final EcommerceQaPairRepository qaPairRepository;
     private final EcommerceProperties ecommerceProperties;
@@ -63,11 +61,11 @@ public class EcommerceKnowledgeImportService {
     private final EmbeddingModel embeddingModel;
     private final QaClassifier qaClassifier;
 
-    private static final String COLLECTION_NAME = "ecommerce_qa";
     private static final String HASH_SEPARATOR = "||";
 
     public EcommerceKnowledgeImportService(
             @Autowired(required = false) MilvusClientV2 milvusClient,
+            MilvusAdminService milvusAdminService,
             ObjectMapper objectMapper,
             EcommerceQaPairRepository qaPairRepository,
             EcommerceProperties ecommerceProperties,
@@ -75,6 +73,7 @@ public class EcommerceKnowledgeImportService {
             EmbeddingModel embeddingModel,
             QaClassifier qaClassifier) {
         this.milvusClient = milvusClient;
+        this.milvusAdminService = milvusAdminService;
         this.objectMapper = objectMapper;
         this.qaPairRepository = qaPairRepository;
         this.ecommerceProperties = ecommerceProperties;
@@ -223,17 +222,33 @@ public class EcommerceKnowledgeImportService {
      * - 批次级提交：每批 saveAll+flush 独立事务，中途失败不影响已提交批次
      */
     public ImportResult importFromFile(String filePath) throws Exception {
+        return importFromFile(filePath, TenantContext.currentTenant());
+    }
+
+    /**
+     * 按租户导入：default 租户写入基础集合，其他租户写入 {@code <base>_<tenantId>}。
+     *
+     * <p>调用方若在异步线程中执行，必须先通过 {@link TenantContext#wrap(Runnable)}
+     * 传递租户上下文，否则会退化成 default 租户。</p>
+     */
+    public ImportResult importFromFile(String filePath, String tenantId) throws Exception {
         ensureMilvusWritable();
         if (milvusClient == null) {
             throw new IllegalStateException("Milvus 客户端不可用，请检查连接配置");
         }
+        String tenant = normalizeTenant(tenantId);
+        String collectionName = collectionForTenant(tenant);
+        // 集合缺失时导入会整批失败，这里先确保集合与索引就绪（幂等）
+        milvusAdminService.ensureCollection(collectionName, ecommerceProperties.getMilvus().getDimension());
 
         ImportResult result = new ImportResult();
         result.filePath = filePath;
+        result.tenantId = tenant;
+        result.collection = collectionName;
         String fileName = Paths.get(filePath).getFileName().toString();
 
         // 1. 解析 + 清洗 + 分类
-        log.info("===== 开始导入: {} =====", filePath);
+        log.info("===== 开始导入: {} (tenant={}, collection={}) =====", filePath, tenant, collectionName);
         List<QaRecord> allRecords = parseJsonl(filePath);
         allRecords.forEach(r -> r.setSourceFile(fileName));
         result.totalRecords = allRecords.size();
@@ -246,7 +261,7 @@ public class EcommerceKnowledgeImportService {
             int end = Math.min(i + batchSize, allRecords.size());
             List<QaRecord> batch = allRecords.subList(i, end);
             try {
-                processBatch(batch, result);
+                processBatch(batch, result, tenant, collectionName);
             } catch (Exception e) {
                 log.error("批次处理失败 (index={}-{})", i, end, e);
                 result.failedRecords += batch.size();
@@ -266,37 +281,56 @@ public class EcommerceKnowledgeImportService {
 
         // 3. Flush 确保 Milvus 数据落盘
         milvusClient.flush(io.milvus.v2.service.utility.request.FlushReq.builder()
-                .collectionNames(List.of(COLLECTION_NAME))
+                .collectionNames(List.of(collectionName))
                 .build());
 
         long elapsed = System.currentTimeMillis() - startTime;
         result.elapsedSeconds = elapsed / 1000;
-        log.info("===== 导入完成: {} 条已存, {} 条去重跳过, {} 条失败, 耗时 {}s =====",
-                result.storedRecords, result.dedupSkipped, result.failedRecords, result.elapsedSeconds);
+        log.info("===== 导入完成: tenant={}, collection={}, {} 条已存, {} 条去重跳过, {} 条失败, 耗时 {}s =====",
+                tenant, collectionName, result.storedRecords, result.dedupSkipped,
+                result.failedRecords, result.elapsedSeconds);
         return result;
     }
 
+    /** 归一化租户 ID；非法值直接拒绝，避免静默落到 default 造成越权。 */
+    private String normalizeTenant(String tenantId) {
+        AiProperties.Tenant tenant = aiProperties.getTenant();
+        String defaultTenant = tenant == null ? TenantContext.DEFAULT_TENANT : tenant.getDefaultTenant();
+        return TenantContext.resolve(tenantId, defaultTenant);
+    }
+
+    /** default 租户与关闭隔离时使用基础集合；其他租户使用 {@code <base>_<tenantId>}。 */
+    String collectionForTenant(String tenantId) {
+        String base = ecommerceProperties.getMilvus().getCollection();
+        AiProperties.Tenant tenant = aiProperties.getTenant();
+        boolean isolationEnabled = tenant == null || tenant.isEnabled();
+        if (!isolationEnabled || TenantContext.DEFAULT_TENANT.equals(tenantId)) {
+            return base;
+        }
+        return base + "_" + tenantId;
+    }
+
     /** 处理一个批次：去重 → embedding → MySQL → Milvus。 */
-    private void processBatch(List<QaRecord> batch, ImportResult result) {
-        List<QaRecord> toImport = filterExistingRecords(batch, result);
+    private void processBatch(List<QaRecord> batch, ImportResult result, String tenantId, String collectionName) {
+        List<QaRecord> toImport = filterExistingRecords(batch, tenantId, result);
         if (toImport.isEmpty()) {
             return;
         }
 
         Map<String, List<Float>> embeddingsByHash = generateEmbeddingsByHash(toImport);
-        List<EcommerceQaPair> savedPairs = savePairsWithConflictSkip(toImport);
-        writePairsToMilvus(savedPairs, embeddingsByHash);
+        List<EcommerceQaPair> savedPairs = savePairsWithConflictSkip(toImport, tenantId);
+        writePairsToMilvus(savedPairs, embeddingsByHash, collectionName);
 
         result.storedRecords += savedPairs.size();
         log.info("批次完成: {} 条已存 (累计: {})", savedPairs.size(), result.storedRecords);
     }
 
-    private List<QaRecord> filterExistingRecords(List<QaRecord> batch, ImportResult result) {
+    private List<QaRecord> filterExistingRecords(List<QaRecord> batch, String tenantId, ImportResult result) {
         if (!ecommerceProperties.getImportConfig().isDeduplicate()) {
             return batch;
         }
         List<String> hashes = batch.stream().map(QaRecord::getRecordHash).toList();
-        Set<String> existing = qaPairRepository.findAllByRecordHashIn(hashes).stream()
+        Set<String> existing = qaPairRepository.findAllByTenantIdAndRecordHashIn(tenantId, hashes).stream()
                 .map(EcommerceQaPair::getRecordHash)
                 .collect(Collectors.toSet());
         List<QaRecord> filtered = batch.stream()
@@ -324,7 +358,8 @@ public class EcommerceKnowledgeImportService {
     }
 
     private void writePairsToMilvus(List<EcommerceQaPair> savedPairs,
-                                    Map<String, List<Float>> embeddingsByHash) {
+                                    Map<String, List<Float>> embeddingsByHash,
+                                    String collectionName) {
         if (savedPairs.isEmpty()) {
             return;
         }
@@ -334,7 +369,7 @@ public class EcommerceKnowledgeImportService {
                 .filter(java.util.Objects::nonNull)
                 .toList();
         if (!rows.isEmpty()) {
-            milvusClient.insert(InsertReq.builder().collectionName(COLLECTION_NAME).data(rows).build());
+            milvusClient.insert(InsertReq.builder().collectionName(collectionName).data(rows).build());
         }
     }
 
@@ -356,10 +391,11 @@ public class EcommerceKnowledgeImportService {
 
     /** 保存 QA 对到 MySQL；遇到唯一键冲突（并发/重复）逐条跳过冲突记录。 */
     @Transactional
-    protected List<EcommerceQaPair> savePairsWithConflictSkip(List<QaRecord> toImport) {
+    protected List<EcommerceQaPair> savePairsWithConflictSkip(List<QaRecord> toImport, String tenantId) {
         List<EcommerceQaPair> savedPairs = new ArrayList<>();
         try {
             List<EcommerceQaPair> pairs = toImport.stream().map(record -> EcommerceQaPair.builder()
+                    .tenantId(tenantId)
                     .question(record.getQuestion())
                     .answer(record.getAnswer())
                     .qaText(record.getQaText())
@@ -377,6 +413,7 @@ public class EcommerceKnowledgeImportService {
             for (QaRecord record : toImport) {
                 try {
                     EcommerceQaPair pair = EcommerceQaPair.builder()
+                            .tenantId(tenantId)
                             .question(record.getQuestion())
                             .answer(record.getAnswer())
                             .qaText(record.getQaText())
@@ -431,6 +468,8 @@ public class EcommerceKnowledgeImportService {
     @ToString
     public static class ImportResult {
         public String filePath;
+        public String tenantId;
+        public String collection;
         public int totalRecords;
         public int storedRecords;
         public int dedupSkipped;

@@ -80,9 +80,9 @@ public class QueryPlanner {
         if (!StringUtils.hasText(normalized)) {
             return QueryPlanResult.single(normalized, "empty_question");
         }
-//        if (!shouldPlan(normalized, config)) {
-//            return QueryPlanResult.single(normalized, "gate_skipped");
-//        }
+        if (config.isGateEnabled() && !shouldPlan(normalized, config)) {
+            return QueryPlanResult.single(normalized, "gate_skipped");
+        }
 
         try {
             String raw = callPlanner(normalized, config);

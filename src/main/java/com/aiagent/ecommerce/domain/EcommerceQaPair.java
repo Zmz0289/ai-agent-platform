@@ -30,6 +30,11 @@ public class EcommerceQaPair {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    /** 所属租户；与 Milvus 的 {@code <collection>_<tenantId>} 隔离保持一致。 */
+    @Column(name = "tenant_id", nullable = false, length = 64)
+    @Builder.Default
+    private String tenantId = "default";
+
     @Column(nullable = false, length = 1024)
     private String question;
 

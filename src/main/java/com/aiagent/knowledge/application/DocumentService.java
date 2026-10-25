@@ -1,36 +1,33 @@
 package com.aiagent.knowledge.application;
 
-import com.aiagent.knowledge.domain.Document;
-import com.aiagent.knowledge.domain.DocumentProcessingStatus;
-import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.aiagent.infrastructure.config.AiProperties;
 import com.aiagent.infrastructure.idempotency.IdempotencyService;
 import com.aiagent.infrastructure.metrics.PlatformMetricsService;
-import com.aiagent.knowledge.infrastructure.repository.DocumentRepository;
+import com.aiagent.infrastructure.tenant.TenantContext;
+import com.aiagent.knowledge.domain.Document;
+import com.aiagent.knowledge.domain.DocumentProcessingStatus;
+import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.aiagent.knowledge.infrastructure.parser.DocumentParserFactory;
+import com.aiagent.knowledge.infrastructure.repository.DocumentChunkRepository;
+import com.aiagent.knowledge.infrastructure.repository.DocumentRepository;
 import com.aiagent.knowledge.infrastructure.storage.DocumentStagingStorage;
 import com.aiagent.knowledge.infrastructure.storage.DocumentStagingStorage.StagedDocument;
 import com.aiagent.knowledge.infrastructure.vectorstore.VectorStoreService;
-import com.aiagent.knowledge.infrastructure.repository.DocumentChunkRepository;
-import com.aiagent.shared.exception.ResourceStateConflictException;
 import com.aiagent.shared.exception.KnowledgeRetrievalUnavailableException;
+import com.aiagent.shared.exception.ResourceStateConflictException;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
-import org.springframework.web.multipart.MultipartFile;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @Slf4j
 @Service
@@ -118,7 +115,8 @@ public class DocumentService {
             throw new IllegalStateException("Idempotency service is unavailable");
         }
         String requestHash = idempotencyService.fingerprint(
-                "document-upload", fileName, contentType, Long.toString(stagedDocument.size()), contentHash);
+                "document-upload", TenantContext.currentTenant(), fileName, contentType,
+                Long.toString(stagedDocument.size()), contentHash);
 
         try {
             return idempotencyService.execute(
@@ -163,15 +161,19 @@ public class DocumentService {
 
     private Document createDocument(String fileName, String contentType, StagingLease lease) {
         StagedDocument stagedDocument = lease.document();
-        var existingDocument = documentRepository.findByContentHash(stagedDocument.contentHash());
+        String tenantId = TenantContext.currentTenant();
+        var existingDocument = documentRepository.findByTenantIdAndContentHash(
+                tenantId, stagedDocument.contentHash());
         if (existingDocument.isPresent()) {
-            log.info("Document already exists for content hash, reusing document: {}", fileName);
+            log.info("Document already exists for tenant [{}] and content hash, reusing document: {}",
+                    tenantId, fileName);
             return existingDocument.get();
         }
 
-        log.info("Queueing document for async processing: {}", fileName);
+        log.info("Queueing document for async processing: {} (tenant={})", fileName, tenantId);
 
         Document document = Document.builder()
+                .tenantId(tenantId)
                 .fileName(fileName)
                 .fileType(extractFileType(fileName))
                 .fileSize(stagedDocument.size())
@@ -184,7 +186,7 @@ public class DocumentService {
         try {
             document = documentRepository.save(document);
         } catch (DataIntegrityViolationException exception) {
-            return documentRepository.findByContentHash(stagedDocument.contentHash())
+            return documentRepository.findByTenantIdAndContentHash(tenantId, stagedDocument.contentHash())
                     .orElseThrow(() -> exception);
         }
 
@@ -239,11 +241,13 @@ public class DocumentService {
     }
 
     public Map<String, Object> getDocumentStatus(Long documentId) {
-        Document document = documentRepository.findById(documentId)
+        Document document = documentRepository
+                .findByIdAndTenantId(documentId, TenantContext.currentTenant())
                 .orElseThrow(() -> new IllegalArgumentException("Document not found: " + documentId));
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("documentId", document.getId());
+        response.put("tenantId", document.getTenantId());
         response.put("fileName", document.getFileName());
         response.put("fileType", document.getFileType());
         response.put("fileSize", document.getFileSize());
@@ -310,15 +314,23 @@ public class DocumentService {
         var chunks = documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(documentId);
         for (var chunk : chunks) {
             if (StringUtils.hasText(chunk.getVectorId())) {
-                vectorStoreService.remove(chunk.getVectorId());
+                removeVector(chunk.getVectorId(), document.getTenantId());
             }
         }
         documentRepository.delete(document);
         stagingStorage.deleteQuietly(document.getStagingPath());
     }
 
+    private void removeVector(String vectorId, String tenantId) {
+        if (tenantId == null || TenantContext.DEFAULT_TENANT.equals(tenantId)) {
+            vectorStoreService.remove(vectorId);
+            return;
+        }
+        vectorStoreService.remove(vectorId, tenantId);
+    }
+
     private Document getDocumentForUpdate(Long documentId) {
-        return documentRepository.findByIdForUpdate(documentId)
+        return documentRepository.findByIdForUpdateAndTenantId(documentId, TenantContext.currentTenant())
                 .orElseThrow(() -> new IllegalArgumentException("Document not found: " + documentId));
     }
 
@@ -344,7 +356,12 @@ public class DocumentService {
     }
 
     public List<RetrievalChunk> searchSimilar(String query, int topK, double threshold) {
-        return searchSimilar(query, List.of(topK), threshold).getOrDefault(topK, List.of());
+        return doSearchSimilar(query, List.of(topK), threshold, TenantContext.currentTenant())
+                .getOrDefault(topK, List.of());
+    }
+
+    public List<RetrievalChunk> searchSimilar(String query, int topK, double threshold, String tenantId) {
+        return doSearchSimilar(query, List.of(topK), threshold, tenantId).getOrDefault(topK, List.of());
     }
 
     /**
@@ -394,6 +411,20 @@ public class DocumentService {
     public Map<Integer, List<RetrievalChunk>> searchSimilar(String query,
                                                             List<Integer> topKs,
                                                             double threshold) {
+        return doSearchSimilar(query, topKs, threshold, TenantContext.currentTenant());
+    }
+
+    public Map<Integer, List<RetrievalChunk>> searchSimilar(String query,
+                                                            List<Integer> topKs,
+                                                            double threshold,
+                                                            String tenantId) {
+        return doSearchSimilar(query, topKs, threshold, tenantId);
+    }
+
+    private Map<Integer, List<RetrievalChunk>> doSearchSimilar(String query,
+                                                               List<Integer> topKs,
+                                                               double threshold,
+                                                               String tenantId) {
         List<Integer> sanitizedTopKs = topKs == null
                 ? List.of()
                 : topKs.stream().filter(topK -> topK != null && topK > 0).distinct().toList();
@@ -405,10 +436,13 @@ public class DocumentService {
                     "Knowledge retrieval is temporarily unavailable");
         }
         var queryEmbedding = embeddingModel.embed(query).content();
+        boolean defaultTenant = tenantId == null || TenantContext.DEFAULT_TENANT.equals(tenantId);
         Map<Integer, List<RetrievalChunk>> results = new LinkedHashMap<>();
         for (int topK : sanitizedTopKs) {
             List<dev.langchain4j.store.embedding.EmbeddingMatch<TextSegment>> matches =
-                    vectorStoreService.search(queryEmbedding, topK, threshold);
+                    defaultTenant
+                            ? vectorStoreService.search(queryEmbedding, topK, threshold)
+                            : vectorStoreService.search(queryEmbedding, topK, threshold, tenantId);
             results.put(topK, toRetrievalChunks(matches));
         }
         return results;

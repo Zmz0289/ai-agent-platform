@@ -20,6 +20,11 @@ public class Document {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    /** 租户标识；存量数据统一回填为 default。 */
+    @Column(name = "tenant_id", nullable = false, length = 64)
+    @Builder.Default
+    private String tenantId = "default";
+
     @Column(nullable = false, length = 255)
     private String fileName;
 

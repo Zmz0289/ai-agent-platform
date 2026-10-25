@@ -1,6 +1,7 @@
 package com.aiagent.infrastructure.memory;
 
 import com.aiagent.infrastructure.config.AiProperties;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.input.PromptTemplate;
@@ -9,15 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
-import java.util.AbstractMap;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -67,7 +60,7 @@ public class LongContextManager {
 
     @SuppressWarnings("unchecked")
     public void saveMessageAndMaybeSummarize(String sessionId, String role, String content) {
-        String historyKey = HISTORY_PREFIX + sessionId;
+        String historyKey = key(HISTORY_PREFIX, sessionId);
         List<Map<String, String>> messages = (List<Map<String, String>>) redisTemplate.opsForValue().get(historyKey);
         if (messages == null) {
             messages = new ArrayList<>();
@@ -85,7 +78,7 @@ public class LongContextManager {
         redisTemplate.opsForValue().set(historyKey, messages, aiProperties.getSession().getTtl(), TimeUnit.SECONDS);
 
         // Counted separately from the history list, whose size is capped by the sliding window.
-        String turnCountKey = TURN_COUNT_PREFIX + sessionId;
+        String turnCountKey = key(TURN_COUNT_PREFIX, sessionId);
         Long totalTurns = redisTemplate.opsForValue().increment(turnCountKey);
         redisTemplate.expire(turnCountKey, aiProperties.getSession().getTtl(), TimeUnit.SECONDS);
 
@@ -99,7 +92,7 @@ public class LongContextManager {
 
     @SuppressWarnings("unchecked")
     private String getSlidingWindowHistory(String sessionId) {
-        String historyKey = HISTORY_PREFIX + sessionId;
+        String historyKey = key(HISTORY_PREFIX, sessionId);
         List<Map<String, String>> messages = (List<Map<String, String>>) redisTemplate.opsForValue().get(historyKey);
         if (messages == null || messages.isEmpty()) {
             return "";
@@ -111,7 +104,7 @@ public class LongContextManager {
 
     @SuppressWarnings("unchecked")
     public List<Map<String, String>> getHistoryMessages(String sessionId) {
-        String historyKey = HISTORY_PREFIX + sessionId;
+        String historyKey = key(HISTORY_PREFIX, sessionId);
         List<Map<String, String>> messages = (List<Map<String, String>>) redisTemplate.opsForValue().get(historyKey);
         return messages != null ? messages : new ArrayList<>();
     }
@@ -129,7 +122,7 @@ public class LongContextManager {
             variables.put("conversation", conversationText);
             String summary = chatLanguageModel.generate(PromptTemplate.from(SUMMARY_PROMPT).apply(variables).text());
 
-            String summaryKey = SUMMARY_PREFIX + sessionId;
+            String summaryKey = key(SUMMARY_PREFIX, sessionId);
             List<Map<String, Object>> summaries = (List<Map<String, Object>>) redisTemplate.opsForValue().get(summaryKey);
             if (summaries == null) {
                 summaries = new ArrayList<>();
@@ -159,7 +152,7 @@ public class LongContextManager {
 
     @SuppressWarnings("unchecked")
     private String retrieveRelevantSummaries(String sessionId, String question) {
-        String summaryKey = SUMMARY_PREFIX + sessionId;
+        String summaryKey = key(SUMMARY_PREFIX, sessionId);
         List<Map<String, Object>> summaries = (List<Map<String, Object>>) redisTemplate.opsForValue().get(summaryKey);
         if (summaries == null || summaries.isEmpty()) {
             return "";
@@ -262,8 +255,19 @@ public class LongContextManager {
     }
 
     public void clearSession(String sessionId) {
-        redisTemplate.delete(HISTORY_PREFIX + sessionId);
-        redisTemplate.delete(SUMMARY_PREFIX + sessionId);
-        redisTemplate.delete(TURN_COUNT_PREFIX + sessionId);
+        redisTemplate.delete(key(HISTORY_PREFIX, sessionId));
+        redisTemplate.delete(key(SUMMARY_PREFIX, sessionId));
+        redisTemplate.delete(key(TURN_COUNT_PREFIX, sessionId));
+    }
+
+    /**
+     * default 租户保持原有 key（兼容存量会话记忆），其他租户增加租户前缀，
+     * 避免同一 sessionId 在不同租户间串会话。
+     */
+    private String key(String prefix, String sessionId) {
+        String tenant = TenantContext.currentTenant();
+        return TenantContext.DEFAULT_TENANT.equals(tenant)
+                ? prefix + sessionId
+                : prefix + tenant + ":" + sessionId;
     }
 }

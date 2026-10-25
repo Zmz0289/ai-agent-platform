@@ -34,6 +34,7 @@ class EcommerceKnowledgeImportServiceTest {
                 org.mockito.ArgumentMatchers.anyString())).thenReturn("shipping");
         service = new EcommerceKnowledgeImportService(
                 null,
+                mock(com.aiagent.knowledge.infrastructure.vectorstore.MilvusAdminService.class),
                 new ObjectMapper(),
                 mock(EcommerceQaPairRepository.class),
                 new EcommerceProperties(),
@@ -77,5 +78,11 @@ class EcommerceKnowledgeImportServiceTest {
         assertThatThrownBy(() -> service.parseJsonl(tempDir.resolve("missing.jsonl").toString()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("文件不存在");
+    }
+
+    @Test
+    void shouldRouteTenantToDedicatedCollection() {
+        assertThat(service.collectionForTenant("default")).isEqualTo("ecommerce_qa");
+        assertThat(service.collectionForTenant("tenant_a")).isEqualTo("ecommerce_qa_tenant_a");
     }
 }

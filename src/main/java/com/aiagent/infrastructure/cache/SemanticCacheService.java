@@ -1,9 +1,10 @@
 package com.aiagent.infrastructure.cache;
 
+import com.aiagent.infrastructure.metrics.PlatformMetricsService;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import jakarta.annotation.PostConstruct;
-import com.aiagent.infrastructure.metrics.PlatformMetricsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -54,7 +55,8 @@ public class SemanticCacheService {
     }
 
     public String getIfCached(String namespace, String question) {
-        validateNamespace(namespace);
+        String effectiveNamespace = effectiveNamespace(namespace);
+        validateNamespace(effectiveNamespace);
         var sample = metricsService.startSample();
         boolean hit = false;
         double bestScore = 0;
@@ -87,7 +89,7 @@ public class SemanticCacheService {
                 Object answerValue = entry.get("answer");
                 Object namespaceValue = entry.get("namespace");
                 String entryNamespace = namespaceValue instanceof String value ? value : "default";
-                if (!namespace.equals(entryNamespace)) {
+                if (!effectiveNamespace.equals(entryNamespace)) {
                     continue;
                 }
                 if (!(embeddingValue instanceof float[] cachedEmbedding) || !(answerValue instanceof String cachedAnswer)) {
@@ -122,7 +124,8 @@ public class SemanticCacheService {
     }
 
     public void put(String namespace, String question, String answer) {
-        validateNamespace(namespace);
+        String effectiveNamespace = effectiveNamespace(namespace);
+        validateNamespace(effectiveNamespace);
         CacheExceptionHandler.safeWrite("Semantic", () -> {
             Embedding embedding = getEmbedding(question);
             if (embedding == null) {
@@ -130,10 +133,10 @@ public class SemanticCacheService {
                 return;
             }
 
-            String cacheKey = CACHE_PREFIX + sha256(namespace + "\u001f" + question);
+            String cacheKey = CACHE_PREFIX + sha256(effectiveNamespace + "\u001f" + question);
 
             Map<String, Object> entry = Map.of(
-                    "namespace", namespace,
+                    "namespace", effectiveNamespace,
                     "question", question,
                     "answer", answer,
                     "embedding", embedding.vector(),
@@ -171,9 +174,18 @@ public class SemanticCacheService {
     }
 
     private void validateNamespace(String namespace) {
-        if (!StringUtils.hasText(namespace) || namespace.length() > 64) {
-            throw new IllegalArgumentException("Semantic cache namespace must contain 1 to 64 characters");
+        if (!StringUtils.hasText(namespace) || namespace.length() > 128) {
+            throw new IllegalArgumentException("Semantic cache namespace must contain 1 to 128 characters");
         }
+    }
+
+    /**
+     * 语义缓存按租户隔离：default 租户保持原 namespace（兼容存量缓存），
+     * 其他租户追加租户后缀，避免相似问题跨租户命中答案。
+     */
+    private String effectiveNamespace(String namespace) {
+        String tenant = TenantContext.currentTenant();
+        return TenantContext.DEFAULT_TENANT.equals(tenant) ? namespace : namespace + ":" + tenant;
     }
 
     private String sha256(String value) {

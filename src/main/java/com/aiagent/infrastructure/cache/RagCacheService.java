@@ -1,8 +1,9 @@
 package com.aiagent.infrastructure.cache;
 
+import com.aiagent.infrastructure.metrics.PlatformMetricsService;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import com.aiagent.knowledge.domain.RetrievalChunk;
 import jakarta.annotation.PostConstruct;
-import com.aiagent.infrastructure.metrics.PlatformMetricsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -29,7 +30,7 @@ public class RagCacheService {
 
     @SuppressWarnings("unchecked")
     public List<RetrievalChunk> getCachedResults(String query) {
-        String key = CacheKeyUtil.buildKey(CACHE_PREFIX, query);
+        String key = cacheKey(query);
         List<RetrievalChunk> result = CacheExceptionHandler.safeRead("RAG", () -> {
             Object cached = redisTemplate.opsForValue().get(key);
             return cached instanceof List ? (List<RetrievalChunk>) cached : null;
@@ -42,9 +43,20 @@ public class RagCacheService {
         if (results == null || results.isEmpty()) {
             return;
         }
-        String key = CacheKeyUtil.buildKey(CACHE_PREFIX, query);
+        String key = cacheKey(query);
         CacheExceptionHandler.safeWrite("RAG", () -> {
             redisTemplate.opsForValue().set(key, results, CACHE_TTL_HOURS, TimeUnit.HOURS);
         });
+    }
+
+    /**
+     * default 租户沿用原有 key（兼容存量缓存），其他租户增加租户前缀，避免跨租户命中召回结果。
+     */
+    private String cacheKey(String query) {
+        String tenant = TenantContext.currentTenant();
+        String prefix = TenantContext.DEFAULT_TENANT.equals(tenant)
+                ? CACHE_PREFIX
+                : CACHE_PREFIX + tenant + ":";
+        return CacheKeyUtil.buildKey(prefix, query);
     }
 }

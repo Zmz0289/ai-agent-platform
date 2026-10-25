@@ -105,6 +105,7 @@ public class SecurityConfig {
                             "/api/v1/agent/evaluate",
                             "/api/v1/agent/evaluate/**",
                             "/api/v1/ecommerce/**",
+                            "/api/v1/tenants/**",
                             "/api/cs/**"
                     ).hasRole("ADMIN")
                     .anyRequest().authenticated();

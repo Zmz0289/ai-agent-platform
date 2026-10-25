@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.nio.charset.Charset;
 import java.util.List;
 
@@ -70,4 +72,22 @@ class DocumentParserReliabilityTest {
         assertThat(parsed).contains("[Page 1]");
         assertThat(parsed).contains("[Page 2]");
     }
+
+    @Test
+    void pdfParseTest() throws Exception {
+        File file = new File("C:\\Users\\Administrator\\Desktop\\“银狐”木马“甲蚁（G01）”团伙全量仿冒网站清单.pdf");
+
+        PdfDocumentParser pdfDocumentParser = new PdfDocumentParser();
+
+        try (FileInputStream fis = new FileInputStream(file)) {
+            try (ByteArrayInputStream bais = new ByteArrayInputStream(fis.readAllBytes())){
+                String parse = pdfDocumentParser.parse(bais);
+
+                System.out.println("parse = " + parse);
+            }
+
+        }
+
+    }
+
 }

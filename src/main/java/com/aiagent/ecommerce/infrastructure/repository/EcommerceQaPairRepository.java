@@ -17,6 +17,8 @@ public interface EcommerceQaPairRepository extends JpaRepository<EcommerceQaPair
 
     List<EcommerceQaPair> findAllByRecordHashIn(Collection<String> recordHashes);
 
+    List<EcommerceQaPair> findAllByTenantIdAndRecordHashIn(String tenantId, Collection<String> recordHashes);
+
     long countByIdInAndStatus(Collection<Long> ids, Integer status);
 
     @Query(value = """
@@ -28,11 +30,13 @@ public interface EcommerceQaPairRepository extends JpaRepository<EcommerceQaPair
                    MATCH(qa.question) AGAINST (:query IN NATURAL LANGUAGE MODE) AS lexicalScore
               FROM ecommerce_qa_pairs qa
              WHERE qa.status = 1
+               AND qa.tenant_id = :tenantId
                AND MATCH(qa.question) AGAINST (:query IN NATURAL LANGUAGE MODE) > 0
              ORDER BY lexicalScore DESC, qa.id ASC
              LIMIT :limit
             """, nativeQuery = true)
-    List<LexicalCandidate> searchQuestionFullText(@Param("query") String query,
+    List<LexicalCandidate> searchQuestionFullText(@Param("tenantId") String tenantId,
+                                                  @Param("query") String query,
                                                   @Param("limit") int limit);
 
     @Modifying

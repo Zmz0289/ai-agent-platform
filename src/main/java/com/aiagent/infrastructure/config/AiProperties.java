@@ -22,6 +22,7 @@ public class AiProperties {
     private Observability observability = new Observability();
     private Performance performance = new Performance();
     private Protection protection = new Protection();
+    private Tenant tenant = new Tenant();
 
     @Data
     public static class Model {
@@ -197,6 +198,8 @@ public class AiProperties {
         private int maxExpansions = 2;
         /** L2 子问题条数上限。 */
         private int maxSubQueries = 3;
+        /** 门控开关；关闭后每次检索都会调用 LLM 规划（仅用于联调，成本较高）。 */
+        private boolean gateEnabled = true;
         /** 问题长度达到该值才考虑调用 planner。 */
         private int gateMinLength = 30;
         /** 问号数量达到该值视为多意图，触发 planner。 */
@@ -349,7 +352,8 @@ public class AiProperties {
     public static class Cors {
         private List<String> allowedOrigins = List.of("http://localhost:8081");
         private List<String> allowedMethods = List.of("GET", "POST", "PUT", "DELETE", "OPTIONS");
-        private List<String> allowedHeaders = List.of("Authorization", "Content-Type", "Accept", "X-Admin-Api-Key", "X-Requested-With");
+        private List<String> allowedHeaders = List.of(
+                "Authorization", "Content-Type", "Accept", "X-Admin-Api-Key", "X-Requested-With", "X-Tenant-Id");
         private boolean allowCredentials = false;
         private long maxAge = 3600;
     }
@@ -357,6 +361,19 @@ public class AiProperties {
     @Data
     public static class Observability {
         private boolean publicMetrics = false;
+    }
+
+    /**
+     * 多租户隔离配置。
+     *
+     * <p>开启后每个请求按请求头解析租户，文档、向量集合、检索缓存与会话记忆
+     * 均按租户隔离；未携带请求头时使用 {@code default-tenant}，与存量数据保持兼容。</p>
+     */
+    @Data
+    public static class Tenant {
+        private boolean enabled = true;
+        private String headerName = "X-Tenant-Id";
+        private String defaultTenant = "default";
     }
 
     @Data

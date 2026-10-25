@@ -1,13 +1,13 @@
 package com.aiagent.knowledge.application;
 
 import com.aiagent.infrastructure.config.AiProperties;
-import com.aiagent.knowledge.infrastructure.parser.DocumentParserFactory;
-import com.aiagent.knowledge.infrastructure.splitter.TextSplitter;
+import com.aiagent.infrastructure.metrics.PlatformMetricsService;
 import com.aiagent.knowledge.domain.Document;
 import com.aiagent.knowledge.domain.DocumentProcessingStatus;
-import com.aiagent.infrastructure.metrics.PlatformMetricsService;
+import com.aiagent.knowledge.infrastructure.parser.DocumentParserFactory;
 import com.aiagent.knowledge.infrastructure.repository.DocumentChunkRepository;
 import com.aiagent.knowledge.infrastructure.repository.DocumentRepository;
+import com.aiagent.knowledge.infrastructure.splitter.TextSplitter;
 import com.aiagent.knowledge.infrastructure.storage.DocumentStagingStorage;
 import com.aiagent.knowledge.infrastructure.vectorstore.VectorStoreService;
 import dev.langchain4j.data.embedding.Embedding;
@@ -17,6 +17,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.io.InputStream;
 import java.time.LocalDateTime;
@@ -59,10 +60,11 @@ public class DocumentIngestionService {
             if (stagingPath == null || stagingPath.isBlank()) {
                 throw new IllegalStateException("Document staging path is missing");
             }
-            removePreviouslyPersistedChunks(documentId);
+            String tenantId = StringUtils.hasText(document.getTenantId()) ? document.getTenantId() : "default";
+            removePreviouslyPersistedChunks(documentId, tenantId);
             try (InputStream inputStream = stagingStorage.open(stagingPath)) {
                 String content = parserFactory.parse(document.getFileName(), inputStream);
-                chunkCount = processContent(document.getFileName(), content, documentId);
+                chunkCount = processContent(document.getFileName(), content, documentId, tenantId);
             }
             markProcessingCompleted(documentId, chunkCount);
             completed = true;
@@ -80,6 +82,10 @@ public class DocumentIngestionService {
     }
 
     public int processContent(String fileName, String content, Long documentId) {
+        return processContent(fileName, content, documentId, "default");
+    }
+
+    public int processContent(String fileName, String content, Long documentId, String tenantId) {
         AiProperties.Document docConfig = aiProperties.getDocument();
         List<TextSegment> segments = textSplitter.split(content, docConfig.getChunkSize(), docConfig.getChunkOverlap());
         if (segments.isEmpty()) {
@@ -88,6 +94,7 @@ public class DocumentIngestionService {
 
         for (int i = 0; i < segments.size(); i++) {
             TextSegment segment = segments.get(i);
+            segment.metadata().put("tenantId", tenantId);
             segment.metadata().put("documentId", documentId);
             segment.metadata().put("fileName", fileName);
             segment.metadata().put("chunkIndex", i);
@@ -98,9 +105,11 @@ public class DocumentIngestionService {
         if (embeddings.size() != segments.size()) {
             throw new IllegalStateException("Embedding count does not match document chunk count");
         }
-        List<String> vectorIds = vectorStoreService.addAll(embeddings, segments);
+        List<String> vectorIds = isDefaultTenant(tenantId)
+                ? vectorStoreService.addAll(embeddings, segments)
+                : vectorStoreService.addAll(embeddings, segments, tenantId);
         if (vectorIds.size() != segments.size() || vectorIds.stream().anyMatch(id -> id == null || id.isBlank())) {
-            removeVectorsQuietly(vectorIds);
+            removeVectorsQuietly(vectorIds, tenantId);
             throw new IllegalStateException("Vector store did not return an id for every document chunk");
         }
 
@@ -117,7 +126,7 @@ public class DocumentIngestionService {
         try {
             documentChunkRepository.saveAll(chunks);
         } catch (RuntimeException exception) {
-            removeVectorsQuietly(vectorIds);
+            removeVectorsQuietly(vectorIds, tenantId);
             throw exception;
         }
 
@@ -152,12 +161,12 @@ public class DocumentIngestionService {
         documentRepository.save(document);
     }
 
-    private void removePreviouslyPersistedChunks(Long documentId) {
+    private void removePreviouslyPersistedChunks(Long documentId, String tenantId) {
         List<com.aiagent.knowledge.domain.DocumentChunk> existingChunks =
                 documentChunkRepository.findByDocumentIdOrderByChunkIndexAsc(documentId);
         for (com.aiagent.knowledge.domain.DocumentChunk chunk : existingChunks) {
             if (chunk.getVectorId() != null && !chunk.getVectorId().isBlank()) {
-                vectorStoreService.remove(chunk.getVectorId());
+                removeVector(chunk.getVectorId(), tenantId);
             }
         }
         if (!existingChunks.isEmpty()) {
@@ -166,16 +175,33 @@ public class DocumentIngestionService {
     }
 
     private void removeVectorsQuietly(List<String> vectorIds) {
+        removeVectorsQuietly(vectorIds, "default");
+    }
+
+    private void removeVectorsQuietly(List<String> vectorIds, String tenantId) {
         for (String vectorId : vectorIds) {
             if (vectorId == null || vectorId.isBlank()) {
                 continue;
             }
             try {
-                vectorStoreService.remove(vectorId);
+                removeVector(vectorId, tenantId);
             } catch (RuntimeException cleanupException) {
-                log.warn("Failed to roll back vector [{}]: {}", vectorId, cleanupException.getMessage());
+                log.warn("Failed to roll back vector [{}] (tenant={}): {}",
+                        vectorId, tenantId, cleanupException.getMessage());
             }
         }
+    }
+
+    private void removeVector(String vectorId, String tenantId) {
+        if (isDefaultTenant(tenantId)) {
+            vectorStoreService.remove(vectorId);
+            return;
+        }
+        vectorStoreService.remove(vectorId, tenantId);
+    }
+
+    private boolean isDefaultTenant(String tenantId) {
+        return !StringUtils.hasText(tenantId) || "default".equals(tenantId);
     }
 
     private void cleanupCompletedStaging(Long documentId, String stagingPath) {

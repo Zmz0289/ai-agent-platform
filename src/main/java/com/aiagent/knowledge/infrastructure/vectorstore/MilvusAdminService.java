@@ -2,8 +2,12 @@ package com.aiagent.knowledge.infrastructure.vectorstore;
 
 import com.aiagent.infrastructure.config.AiProperties;
 import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.DataType;
 import io.milvus.v2.common.IndexBuildState;
 import io.milvus.v2.common.IndexParam;
+import io.milvus.v2.service.collection.request.AddFieldReq;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.index.request.CreateIndexReq;
 import io.milvus.v2.service.index.request.DescribeIndexReq;
@@ -65,6 +69,100 @@ public class MilvusAdminService {
                 .build());
 
         log.info("Collection [{}] HNSW 索引创建指令已发出", collectionName);
+    }
+
+    /**
+     * 确保 QA 集合同步就绪：不存在则按 QA Schema 建集合、建索引，最后加载到内存。
+     *
+     * <p>启动期自动建集合只在 {@code ai.vector-store.mode=qa} 时发生，
+     * 导入链路不能假设集合已存在，否则所有批次写入都会失败。</p>
+     *
+     * @return true 表示本次新建了集合，false 表示集合已存在
+     */
+    public boolean ensureCollection(String collectionName, int dimension) {
+        if (milvusClient == null) {
+            throw new IllegalStateException("Milvus 客户端不可用，请检查连接配置");
+        }
+        ensureWritable();
+
+        boolean exists = milvusClient.hasCollection(HasCollectionReq.builder()
+                .collectionName(collectionName)
+                .build());
+        if (!exists) {
+            createQaCollection(collectionName, dimension);
+        }
+        milvusClient.loadCollection(LoadCollectionReq.builder()
+                .collectionName(collectionName)
+                .build());
+        log.info("Collection [{}] 已就绪 (dimension={}, created={})", collectionName, dimension, !exists);
+        return !exists;
+    }
+
+    /** 按与启动期一致的 QA Schema 创建集合，并建立 HNSW/COSINE 索引。 */
+    private void createQaCollection(String collectionName, int dimension) {
+        CreateCollectionReq.CollectionSchema schema = milvusClient.createSchema();
+        schema.addField(AddFieldReq.builder()
+                .fieldName("id")
+                .dataType(DataType.Int64)
+                .isPrimaryKey(true)
+                .autoID(true)
+                .description("Primary key")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("question")
+                .dataType(DataType.VarChar)
+                .maxLength(1024)
+                .description("Question")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("answer")
+                .dataType(DataType.VarChar)
+                .maxLength(2048)
+                .description("Answer")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("qa_text")
+                .dataType(DataType.VarChar)
+                .maxLength(3072)
+                .description("Joined QA text")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("qa_pair_id")
+                .dataType(DataType.Int64)
+                .description("MySQL ecommerce_qa_pairs.id")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("category")
+                .dataType(DataType.VarChar)
+                .maxLength(100)
+                .description("Category")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("source_file")
+                .dataType(DataType.VarChar)
+                .maxLength(255)
+                .description("Source training file name")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("embedding")
+                .dataType(DataType.FloatVector)
+                .dimension(dimension)
+                .description("Embedding vector")
+                .build());
+        schema.addField(AddFieldReq.builder()
+                .fieldName("ts")
+                .dataType(DataType.Int64)
+                .description("Timestamp")
+                .build());
+
+        milvusClient.createCollection(CreateCollectionReq.builder()
+                .collectionName(collectionName)
+                .collectionSchema(schema)
+                .description("Ecommerce QA knowledge base")
+                .build());
+        log.info("Collection [{}] 创建成功 (dimension={})", collectionName, dimension);
+
+        createIndex(collectionName);
     }
 
     /**

@@ -1,6 +1,7 @@
 package com.aiagent.knowledge.infrastructure.vectorstore;
 
 import com.aiagent.infrastructure.config.AiProperties;
+import com.aiagent.infrastructure.tenant.TenantContext;
 import com.aiagent.knowledge.domain.RetrievalChunk;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -27,10 +28,8 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Milvus V2 适配器，读取项目已有的 QA collection schema。
@@ -51,6 +50,7 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
     private final AiProperties aiProperties;
     private final MilvusClientV2 milvusClient;
     private final InMemoryVectorStoreService fallbackStore = new InMemoryVectorStoreService();
+    private final Set<String> knownCollections = ConcurrentHashMap.newKeySet();
     private boolean available;
 
     public MilvusQaVectorStoreService(
@@ -104,6 +104,11 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
 
     @Override
     public List<String> addAll(List<Embedding> embeddings, List<TextSegment> segments) {
+        return addAll(embeddings, segments, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<String> addAll(List<Embedding> embeddings, List<TextSegment> segments, String tenantId) {
         if (embeddings == null || segments == null || embeddings.size() != segments.size()) {
             throw new IllegalArgumentException("Embeddings and segments must have the same size");
         }
@@ -112,9 +117,13 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
         }
         if (!available) {
             requireFallbackEnabled();
-            return fallbackStore.addAll(embeddings, segments);
+            return fallbackStore.addAll(embeddings, segments, tenantId);
         }
 
+        String targetCollection = collectionName(tenantId);
+        if (!ensureCollection(targetCollection)) {
+            throw new IllegalStateException("Tenant QA collection is not provisioned: " + targetCollection);
+        }
         List<JsonObject> rows = new ArrayList<>(segments.size());
         for (int index = 0; index < segments.size(); index++) {
             Embedding embedding = embeddings.get(index);
@@ -126,7 +135,7 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
         }
 
         var response = milvusClient.insert(InsertReq.builder()
-                .collectionName(collectionName())
+                .collectionName(targetCollection)
                 .data(rows)
                 .build());
         if (response.getPrimaryKeys() == null) {
@@ -137,15 +146,23 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
 
     @Override
     public List<EmbeddingMatch<TextSegment>> search(Embedding queryEmbedding, int topK, double minScore) {
+        return search(queryEmbedding, topK, minScore, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<EmbeddingMatch<TextSegment>> search(Embedding queryEmbedding,
+                                                    int topK,
+                                                    double minScore,
+                                                    String tenantId) {
         if (queryEmbedding == null || topK <= 0) {
             return List.of();
         }
         if (!available) {
             return fallbackEnabled() && !readOnly()
-                    ? fallbackStore.search(queryEmbedding, topK, minScore)
+                    ? fallbackStore.search(queryEmbedding, topK, minScore, tenantId)
                     : List.of();
         }
-        return searchInCollection(collectionName(), queryEmbedding, topK, minScore);
+        return searchInCollection(collectionName(tenantId), queryEmbedding, topK, minScore);
     }
 
     @Override
@@ -160,6 +177,10 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
                                                                  Embedding queryEmbedding,
                                                                  int topK,
                                                                  double minScore) {
+        if (!ensureCollection(targetCollection)) {
+            log.warn("Milvus collection [{}] is not provisioned for the current tenant", targetCollection);
+            return List.of();
+        }
         // HNSW 要求 ef >= topK，候选池扩容时动态放大 ef（上限 1024 控制开销）
         int ef = Math.max(64, Math.min(topK * 4, 1024));
         SearchReq request = SearchReq.builder()
@@ -199,11 +220,23 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
 
     @Override
     public List<RetrievalChunk> fetchAllChunks(int maxDocs) {
+        return fetchAllChunks(maxDocs, TenantContext.currentTenant());
+    }
+
+    @Override
+    public List<RetrievalChunk> fetchAllChunks(int maxDocs, String tenantId) {
         if (!available) {
-            return fallbackEnabled() && !readOnly() ? fallbackStore.fetchAllChunks(maxDocs) : List.of();
+            return fallbackEnabled() && !readOnly()
+                    ? fallbackStore.fetchAllChunks(maxDocs, tenantId)
+                    : List.of();
+        }
+        String targetCollection = collectionName(tenantId);
+        if (!ensureCollection(targetCollection)) {
+            log.warn("Milvus collection [{}] is not provisioned for the current tenant", targetCollection);
+            return List.of();
         }
         QueryResp response = milvusClient.query(QueryReq.builder()
-                .collectionName(collectionName())
+                .collectionName(targetCollection)
                 .filter("qa_pair_id >= 0")
                 .outputFields(OUTPUT_FIELDS)
                 .offset(0)
@@ -233,17 +266,27 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
 
     @Override
     public void remove(String id) {
+        remove(id, TenantContext.currentTenant());
+    }
+
+    @Override
+    public void remove(String id, String tenantId) {
         if (readOnly()) {
             throw new IllegalStateException("Milvus QA collection is read-only");
         }
         if (!available) {
             requireFallbackEnabled();
-            fallbackStore.remove(id);
+            fallbackStore.remove(id, tenantId);
+            return;
+        }
+        String targetCollection = collectionName(tenantId);
+        if (!ensureCollection(targetCollection)) {
+            log.warn("Milvus collection [{}] is not provisioned for the current tenant", targetCollection);
             return;
         }
         long qaPairId = parseLongId(id);
         milvusClient.delete(DeleteReq.builder()
-                .collectionName(collectionName())
+                .collectionName(targetCollection)
                 .filter("qa_pair_id == " + qaPairId)
                 .build());
     }
@@ -341,6 +384,53 @@ public class MilvusQaVectorStoreService implements VectorStoreService {
 
     private String collectionName() {
         return aiProperties.getVectorStore().getMilvus().getCollectionName();
+    }
+
+    /**
+     * default 租户与关闭隔离时使用基础 collection；其他租户使用 {@code <base>_<tenantId>}。
+     */
+    private String collectionName(String tenantId) {
+        String base = collectionName();
+        AiProperties.Tenant tenant = aiProperties.getTenant();
+        boolean isolationEnabled = tenant == null || tenant.isEnabled();
+        if (!isolationEnabled
+                || tenantId == null
+                || TenantContext.DEFAULT_TENANT.equals(tenantId)) {
+            return base;
+        }
+        return base + "_" + tenantId;
+    }
+
+    /**
+     * 租户 collection 不存在时不自动建表（QA schema 由初始化器统一创建），直接返回空结果，
+     * 避免误把请求打到其他租户的 collection 上。
+     */
+    private boolean ensureCollection(String targetCollection) {
+        if (!StringUtils.hasText(targetCollection) || milvusClient == null) {
+            return false;
+        }
+        if (targetCollection.equals(collectionName())) {
+            return available;
+        }
+        if (knownCollections.contains(targetCollection)) {
+            return true;
+        }
+        try {
+            if (!milvusClient.hasCollection(HasCollectionReq.builder()
+                    .collectionName(targetCollection)
+                    .build())) {
+                return false;
+            }
+            milvusClient.loadCollection(LoadCollectionReq.builder()
+                    .collectionName(targetCollection)
+                    .build());
+            knownCollections.add(targetCollection);
+            log.info("Tenant QA collection [{}] loaded", targetCollection);
+            return true;
+        } catch (Exception exception) {
+            log.warn("Unable to load Milvus collection [{}]: {}", targetCollection, rootMessage(exception));
+            return false;
+        }
     }
 
     private String faqCollectionName() {
